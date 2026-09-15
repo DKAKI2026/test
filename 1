@@ -1,0 +1,300 @@
+"""
+Méthode de sélection du meilleur dataframe d'entraînement (A ou B)
+en comparant leurs variables explicatives à celles de X (jeu cible).
+
+Deux diagnostics complémentaires :
+1. Validation adversariale (score global de "distinguabilité")
+2. PSI par variable (score détaillé, localise les variables qui dérivent)
+
+Nécessite : pandas, numpy, lightgbm, scikit-learn
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import lightgbm as lgb
+
+
+def variables_communes(df_x: pd.DataFrame, df_candidat: pd.DataFrame) -> list:
+    """Retourne les colonnes explicatives présentes dans les deux dataframes."""
+    return sorted(set(df_x.columns) & set(df_candidat.columns))
+
+
+def score_adversarial(df_x: pd.DataFrame, df_candidat: pd.DataFrame,
+                       variables: list, n_splits: int = 5, random_state: int = 42) -> float:
+    """
+    Entraîne un classifieur à distinguer df_candidat (label 0) de df_x (label 1)
+    en utilisant uniquement les variables communes.
+    Retourne l'AUC moyenne en validation croisée.
+    AUC proche de 0.5 => distributions similaires => bon candidat.
+    AUC proche de 1.0 => distributions très différentes => mauvais candidat.
+    """
+    X_c = df_candidat[variables].copy()
+    X_x = df_x[variables].copy()
+
+    # Encodage simple des catégorielles (à adapter selon tes données)
+    combined = pd.concat([X_c, X_x], axis=0, ignore_index=True)
+    for col in combined.select_dtypes(include=["object", "category"]).columns:
+        combined[col] = combined[col].astype("category").cat.codes
+
+    y = np.array([0] * len(X_c) + [1] * len(X_x))
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    aucs = []
+    for train_idx, test_idx in skf.split(combined, y):
+        model = lgb.LGBMClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            verbosity=-1, random_state=random_state
+        )
+        model.fit(combined.iloc[train_idx], y[train_idx])
+        preds = model.predict_proba(combined.iloc[test_idx])[:, 1]
+        aucs.append(roc_auc_score(y[test_idx], preds))
+
+    return float(np.mean(aucs))
+
+
+def psi(expected: pd.Series, actual: pd.Series, bins: int = 10) -> float:
+    """
+    Calcule le Population Stability Index entre deux distributions
+    d'une même variable (numérique). PSI < 0.1 : stable, 0.1-0.25 : dérive
+    modérée, > 0.25 : dérive importante.
+    """
+    expected = expected.dropna()
+    actual = actual.dropna()
+
+    if pd.api.types.is_numeric_dtype(expected):
+        quantiles = np.linspace(0, 1, bins + 1)
+        breakpoints = np.unique(expected.quantile(quantiles).values)
+        if len(breakpoints) < 3:
+            return np.nan
+        exp_counts = pd.cut(expected, breakpoints, include_lowest=True).value_counts(normalize=True)
+        act_counts = pd.cut(actual, breakpoints, include_lowest=True).value_counts(normalize=True)
+    else:
+        exp_counts = expected.value_counts(normalize=True)
+        act_counts = actual.value_counts(normalize=True)
+
+    exp_counts, act_counts = exp_counts.align(act_counts, fill_value=1e-6)
+    exp_counts = exp_counts.replace(0, 1e-6)
+    act_counts = act_counts.replace(0, 1e-6)
+
+    return float(np.sum((act_counts - exp_counts) * np.log(act_counts / exp_counts)))
+
+
+def psi_par_variable(df_x: pd.DataFrame, df_candidat: pd.DataFrame, variables: list) -> pd.DataFrame:
+    """Calcule le PSI de chaque variable commune entre le candidat et X."""
+    resultats = []
+    for var in variables:
+        try:
+            val = psi(df_candidat[var], df_x[var])
+        except Exception:
+            val = np.nan
+        resultats.append({"variable": var, "psi": val})
+    return pd.DataFrame(resultats).sort_values("psi", ascending=False)
+
+
+def evaluer_candidat(nom: str, df_x: pd.DataFrame, df_candidat: pd.DataFrame) -> dict:
+    """Évalue un candidat sur les deux diagnostics et retourne un résumé."""
+    variables = variables_communes(df_x, df_candidat)
+    auc = score_adversarial(df_x, df_candidat, variables)
+    psi_df = psi_par_variable(df_x, df_candidat, variables)
+
+    return {
+        "nom": nom,
+        "n_variables_communes": len(variables),
+        "auc_adversarial": auc,
+        "score_similarite": 1 - abs(auc - 0.5) * 2,  # 1 = identique, 0 = totalement séparable
+        "psi_moyen": psi_df["psi"].mean(),
+        "top5_variables_derivantes": psi_df.head(5).to_dict("records"),
+    }
+
+
+if __name__ == "__main__":
+    # --- À adapter avec tes vrais dataframes ---
+    # df_x = pd.read_csv("X.csv")
+    # df_a = pd.read_csv("candidat_A.csv")
+    # df_b = pd.read_csv("candidat_B.csv")
+
+    # resultat_a = evaluer_candidat("A", df_x, df_a)
+    # resultat_b = evaluer_candidat("B", df_x, df_b)
+
+    # for r in (resultat_a, resultat_b):
+    #     print(f"\n=== Candidat {r['nom']} ===")
+    #     print(f"Variables communes : {r['n_variables_communes']}")
+    #     print(f"AUC adversariale   : {r['auc_adversarial']:.3f} (0.5 = idéal)")
+    #     print(f"Score similarité    : {r['score_similarite']:.3f} (1 = idéal)")
+    #     print(f"PSI moyen           : {r['psi_moyen']:.3f} (<0.1 = stable)")
+    #     print("Variables les plus dérivantes :")
+    #     for v in r["top5_variables_derivantes"]:
+    #         print(f"  - {v['variable']}: PSI={v['psi']:.3f}")
+
+    # Le candidat avec le score_similarite le plus élevé et le psi_moyen
+    # le plus bas est celui à privilégier pour l'entraînement.
+    pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+Méthode alternative : comparaison des dataframes via Maximum Mean Discrepancy (MMD)
+
+Contrairement à la validation adversariale (classifieur) ou au PSI (univarié),
+le MMD mesure directement l'écart entre deux distributions multivariées dans un
+espace de noyau (RBF), sans entraîner de modèle. Il capture les interactions
+entre variables, pas seulement les marginales.
+
+Nécessite : numpy, pandas, scikit-learn, scipy
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import rbf_kernel
+
+
+def preparer_donnees(df_x: pd.DataFrame, df_candidat: pd.DataFrame, variables: list):
+    """
+    Restreint aux variables communes, encode les catégorielles,
+    standardise (indispensable pour un noyau RBF), et retourne deux
+    matrices numpy comparables.
+    """
+    X_c = df_candidat[variables].copy()
+    X_x = df_x[variables].copy()
+
+    combined = pd.concat([X_c, X_x], axis=0, ignore_index=True)
+    for col in combined.select_dtypes(include=["object", "category"]).columns:
+        combined[col] = combined[col].astype("category").cat.codes
+
+    combined = combined.fillna(combined.median(numeric_only=True))
+
+    scaler = StandardScaler()
+    combined_scaled = scaler.fit_transform(combined)
+
+    n_c = len(X_c)
+    return combined_scaled[:n_c], combined_scaled[n_c:]
+
+
+def mmd_rbf(A: np.ndarray, B: np.ndarray, gamma: float = None) -> float:
+    """
+    Calcule le MMD^2 (estimateur non biaisé) entre deux échantillons A et B
+    avec un noyau RBF. Plus la valeur est proche de 0, plus les distributions
+    sont similaires.
+    """
+    if gamma is None:
+        # heuristique standard : inverse de la dimensionnalité
+        gamma = 1.0 / A.shape[1]
+
+    K_AA = rbf_kernel(A, A, gamma=gamma)
+    K_BB = rbf_kernel(B, B, gamma=gamma)
+    K_AB = rbf_kernel(A, B, gamma=gamma)
+
+    n, m = len(A), len(B)
+    np.fill_diagonal(K_AA, 0)
+    np.fill_diagonal(K_BB, 0)
+
+    mmd2 = (K_AA.sum() / (n * (n - 1))
+            + K_BB.sum() / (m * (m - 1))
+            - 2 * K_AB.mean())
+    return float(mmd2)
+
+
+def test_permutation_mmd(A: np.ndarray, B: np.ndarray, n_permutations: int = 200,
+                          gamma: float = None, random_state: int = 42) -> dict:
+    """
+    Teste si le MMD observé est significativement différent de 0
+    (c.-à-d. si les deux distributions sont vraiment différentes)
+    via un test de permutation.
+    """
+    rng = np.random.default_rng(random_state)
+    observed = mmd_rbf(A, B, gamma=gamma)
+
+    combined = np.vstack([A, B])
+    n = len(A)
+    null_dist = []
+    for _ in range(n_permutations):
+        perm = rng.permutation(len(combined))
+        A_perm = combined[perm[:n]]
+        B_perm = combined[perm[n:]]
+        null_dist.append(mmd_rbf(A_perm, B_perm, gamma=gamma))
+
+    null_dist = np.array(null_dist)
+    p_value = float((null_dist >= observed).mean())
+
+    return {"mmd": observed, "p_value": p_value, "null_dist_mean": null_dist.mean()}
+
+
+def evaluer_candidat_mmd(nom: str, df_x: pd.DataFrame, df_candidat: pd.DataFrame,
+                          n_permutations: int = 200) -> dict:
+    """Évalue un candidat via MMD + test de permutation."""
+    variables = sorted(set(df_x.columns) & set(df_candidat.columns))
+    A, B = preparer_donnees(df_x, df_candidat, variables)
+    resultat = test_permutation_mmd(A, B, n_permutations=n_permutations)
+    resultat["nom"] = nom
+    resultat["n_variables_communes"] = len(variables)
+    return resultat
+
+
+if __name__ == "__main__":
+    # --- À adapter avec tes vrais dataframes ---
+    # df_x = pd.read_csv("X.csv")
+    # df_a = pd.read_csv("candidat_A.csv")
+    # df_b = pd.read_csv("candidat_B.csv")
+
+    # resultat_a = evaluer_candidat_mmd("A", df_x, df_a)
+    # resultat_b = evaluer_candidat_mmd("B", df_x, df_b)
+
+    # for r in (resultat_a, resultat_b):
+    #     print(f"\n=== Candidat {r['nom']} ===")
+    #     print(f"MMD (distance)     : {r['mmd']:.5f}  (proche de 0 = idéal)")
+    #     print(f"p-value            : {r['p_value']:.3f}  (>0.05 = pas de différence significative)")
+
+    # Le candidat avec le MMD le plus faible ET la p-value la plus élevée
+    # est distributionnellement le plus proche de X.
+    pass
+
