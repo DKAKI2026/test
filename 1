@@ -687,3 +687,157 @@ if __name__ == "__main__":
     # est distributionnellement le plus proche de X.
     pass
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+Visualisation des distributions de X, A et B superposées, variable par
+variable. Complète les scores quantitatifs (PSI, MMD, AUC) par un visuel
+direct : où et comment les distributions divergent.
+
+Nécessite : matplotlib, seaborn
+"""
+
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_theme(style="whitegrid")
+
+COULEURS = {"X": "#F44336", "A": "#1976D2", "B": "#43A047"}
+
+
+def voir_distributions(df_x: pd.DataFrame, df_a: pd.DataFrame, df_b: pd.DataFrame,
+                        nom_a: str = "A", nom_b: str = "B", max_vars: int = 12):
+    """
+    Version simple : un seul appel, calcule automatiquement les variables
+    communes aux trois dataframes et affiche leurs distributions superposées.
+
+    Exemple :
+        voir_distributions(df_x, df_a, df_b)
+    """
+    variables = sorted(set(df_x.columns) & set(df_a.columns) & set(df_b.columns))
+    if len(variables) == 0:
+        raise ValueError("Aucune variable commune aux trois dataframes.")
+
+    plot_distributions_comparees(df_x, df_a, df_b, variables,
+                                  nom_a=nom_a, nom_b=nom_b, max_vars=max_vars)
+
+
+def plot_distributions_comparees(df_x: pd.DataFrame, df_a: pd.DataFrame, df_b: pd.DataFrame,
+                                  variables: list, nom_a: str = "A", nom_b: str = "B",
+                                  nom_x: str = "X", max_vars: int = 12, n_max: int = 5000,
+                                  random_state: int = 42, psi_df_a: pd.DataFrame = None,
+                                  psi_df_b: pd.DataFrame = None):
+    """
+    Trace un grid de distributions superposées pour chaque variable commune.
+
+    variables : liste des variables à afficher (ex: variables_communes_triple(...)).
+    max_vars  : limite le nombre de variables affichées. Si psi_df_a/psi_df_b
+                sont fournis, les variables les plus divergentes (PSI le plus
+                élevé) sont priorisées ; sinon, les premières de la liste.
+    n_max     : sous-échantillonnage par source pour accélérer l'affichage
+                sur de gros dataframes (n'affecte que le visuel, pas les scores).
+    """
+    # Priorise les variables les plus divergentes si le détail PSI est fourni
+    if len(variables) > max_vars and (psi_df_a is not None or psi_df_b is not None):
+        psi_combine = pd.concat([d for d in (psi_df_a, psi_df_b) if d is not None])
+        psi_max = psi_combine.groupby("variable")["psi"].max().sort_values(ascending=False)
+        variables = [v for v in psi_max.index if v in variables][:max_vars]
+    else:
+        variables = variables[:max_vars]
+
+    def echantillon(df):
+        return df.sample(n=n_max, random_state=random_state) if len(df) > n_max else df
+
+    df_x_s, df_a_s, df_b_s = echantillon(df_x), echantillon(df_a), echantillon(df_b)
+
+    n = len(variables)
+    ncols = 3
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows))
+    axes = np.array(axes).reshape(-1)
+
+    for i, var in enumerate(variables):
+        ax = axes[i]
+        est_numerique = all(pd.api.types.is_numeric_dtype(d[var]) for d in (df_x_s, df_a_s, df_b_s))
+
+        if est_numerique:
+            for nom, df_s, couleur in [(nom_x, df_x_s, COULEURS["X"]),
+                                        (nom_a, df_a_s, COULEURS["A"]),
+                                        (nom_b, df_b_s, COULEURS["B"])]:
+                serie = df_s[var].dropna()
+                if serie.nunique() > 1:
+                    sns.kdeplot(serie, ax=ax, label=nom, color=couleur, fill=True, alpha=0.15, linewidth=1.5)
+                else:
+                    ax.axvline(serie.iloc[0], color=couleur, label=nom, linewidth=1.5)
+        else:
+            # Variable catégorielle : barres de proportions côte à côte
+            props = []
+            for nom, df_s in [(nom_x, df_x_s), (nom_a, df_a_s), (nom_b, df_b_s)]:
+                p = df_s[var].value_counts(normalize=True).rename(nom)
+                props.append(p)
+            table = pd.concat(props, axis=1).fillna(0)
+            # limite aux 8 catégories les plus fréquentes pour la lisibilité
+            table = table.loc[table.sum(axis=1).sort_values(ascending=False).head(8).index]
+            table.plot(kind="bar", ax=ax, color=[COULEURS["X"], COULEURS["A"], COULEURS["B"]], legend=False)
+            ax.tick_params(axis="x", rotation=45)
+
+        ax.set_title(var, fontsize=10)
+        ax.set_ylabel("")
+
+    # légende commune, supprime les axes vides restants
+    for j in range(n, len(axes)):
+        fig.delaxes(axes[j])
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("Distributions comparées : X vs candidats", y=1.05, fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    # --- Exemple d'utilisation ---
+    # df_x = pd.read_csv("X.csv")
+    # df_a = pd.read_csv("candidat_A.csv")
+    # df_b = pd.read_csv("candidat_B.csv")
+
+    # Appel simple :
+    # voir_distributions(df_x, df_a, df_b)
+
+    # Ou avec priorisation par PSI (voir plot_distributions_comparees) :
+    # from selection_dataframe_entrainement import variables_communes_triple, psi_par_variable
+    # variables = variables_communes_triple(df_x, df_a, df_b)
+    # psi_a = psi_par_variable(df_x, df_a, variables)
+    # psi_b = psi_par_variable(df_x, df_b, variables)
+    # plot_distributions_comparees(df_x, df_a, df_b, variables, psi_df_a=psi_a, psi_df_b=psi_b)
+    pass
+
