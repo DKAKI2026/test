@@ -823,7 +823,22 @@ def plot_distributions_comparees(df_x: pd.DataFrame, df_a: pd.DataFrame, df_b: p
     plt.tight_layout()
     plt.show()
 
-
+def variables_communes_triple(df_x: pd.DataFrame, df_a: pd.DataFrame, df_b: pd.DataFrame) -> list:
+    """
+    Retourne l'intersection des variables communes à X, A et B.
+ 
+    À utiliser quand A et B n'ont pas le même nombre de colonnes : si on
+    compare A et B chacun avec leur propre intersection vis-à-vis de X,
+    les scores (AUC, MMD) sont calculés sur des espaces de dimension
+    différente et ne sont pas directement comparables entre eux. Cette
+    intersection triple donne un socle de comparaison équitable.
+ 
+    À combiner avec variables_communes(df_x, df_candidat) pour aussi
+    évaluer chaque candidat sur son propre maximum de variables partagées
+    avec X (utile pour l'entraînement final, où on veut exploiter le plus
+    de variables possible).
+    """
+    return sorted(set(df_x.columns) & set(df_a.columns) & set(df_b.columns))
 if __name__ == "__main__":
     # --- Exemple d'utilisation ---
     # df_x = pd.read_csv("X.csv")
