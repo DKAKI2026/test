@@ -355,3 +355,335 @@ if __name__ == "__main__":
     # est distributionnellement le plus proche de X.
     pass
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    """
+Visualisation des résultats des scripts de sélection de dataframe :
+- selection_dataframe_entrainement.py (AUC adversariale + PSI)
+- selection_dataframe_mmd.py (MMD + test de permutation)
+
+Nécessite : matplotlib, seaborn, umap-learn (pip install umap-learn)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_theme(style="whitegrid")
+
+
+# ---------------------------------------------------------------------------
+# 1. Comparaison globale entre candidats (AUC adversariale ou MMD)
+# ---------------------------------------------------------------------------
+def plot_comparaison_candidats(resultats: list[dict], metrique: str = "score_similarite"):
+    """
+    resultats : liste de dicts retournés par evaluer_candidat() ou
+                evaluer_candidat_mmd(), un par candidat.
+    metrique  : "score_similarite" (1=idéal) pour la méthode adversariale,
+                ou "mmd" (0=idéal) pour la méthode MMD.
+    """
+    noms = [r["nom"] for r in resultats]
+    valeurs = [r[metrique] for r in resultats]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    couleurs = sns.color_palette("Greens_d", len(noms)) if metrique == "score_similarite" \
+        else sns.color_palette("Reds_d", len(noms))
+    bars = ax.bar(noms, valeurs, color=couleurs)
+    ax.bar_label(bars, fmt="%.3f")
+    ax.set_ylabel(metrique)
+    ax.set_title(f"Comparaison des candidats — {metrique}")
+    if metrique == "score_similarite":
+        ax.set_ylim(0, 1)
+        ax.axhline(0.5, color="gray", linestyle="--", linewidth=1, label="seuil neutre")
+        ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# 2. PSI par variable, avec seuils colorés
+# ---------------------------------------------------------------------------
+def plot_psi(psi_df: pd.DataFrame, top_n: int = 15, titre: str = "PSI par variable"):
+    """
+    psi_df : dataframe avec colonnes 'variable' et 'psi', retourné par
+             psi_par_variable().
+    Seuils standards : <0.1 stable, 0.1-0.25 dérive modérée, >0.25 dérive forte.
+    """
+    df = psi_df.dropna(subset=["psi"]).sort_values("psi", ascending=True).tail(top_n)
+
+    def couleur(v):
+        if v < 0.1:
+            return "#4CAF50"   # stable
+        elif v < 0.25:
+            return "#FF9800"   # modéré
+        return "#F44336"       # critique
+
+    couleurs = df["psi"].apply(couleur)
+
+    fig, ax = plt.subplots(figsize=(7, max(4, 0.35 * len(df))))
+    ax.barh(df["variable"], df["psi"], color=couleurs)
+    ax.axvline(0.1, color="gray", linestyle="--", linewidth=1)
+    ax.axvline(0.25, color="gray", linestyle="--", linewidth=1)
+    ax.set_xlabel("PSI")
+    ax.set_title(titre)
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# 3. Test de permutation MMD : distribution nulle vs valeur observée
+# ---------------------------------------------------------------------------
+def plot_test_permutation(observed: float, null_dist: np.ndarray, nom_candidat: str = ""):
+    """
+    observed  : le MMD observé (résultat['mmd'])
+    null_dist : liste des MMD calculés sous permutation aléatoire —
+                à récupérer en modifiant test_permutation_mmd() pour
+                retourner null_dist en plus de p_value (voir note ci-dessous).
+    """
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(null_dist, bins=30, color="#90A4AE", alpha=0.8, label="distribution nulle\n(si aucune différence réelle)")
+    ax.axvline(observed, color="#F44336", linewidth=2, label=f"MMD observé = {observed:.4f}")
+    ax.set_xlabel("MMD")
+    ax.set_ylabel("fréquence")
+    ax.set_title(f"Test de permutation — {nom_candidat}")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# 4. Projection 2D (UMAP) — X vs candidat, colorée par origine
+# ---------------------------------------------------------------------------
+def plot_projection_2d(df_x: pd.DataFrame, df_candidat: pd.DataFrame, variables: list,
+                        label_candidat: str = "Candidat", n_max: int = 3000,
+                        random_state: int = 42):
+    """
+    Projette X et le candidat sur le même espace 2D via UMAP, colorés par
+    origine. Sert de confirmation visuelle des scores quantitatifs (AUC,
+    PSI, MMD) — pas de méthode de décision à elle seule.
+    """
+    import umap
+    from sklearn.preprocessing import StandardScaler
+
+    df_c = df_candidat.sample(n=n_max, random_state=random_state) if len(df_candidat) > n_max else df_candidat
+    df_x_s = df_x.sample(n=n_max, random_state=random_state) if len(df_x) > n_max else df_x
+
+    combined = pd.concat([df_c[variables], df_x_s[variables]], axis=0, ignore_index=True)
+    for col in combined.select_dtypes(include=["object", "category"]).columns:
+        combined[col] = combined[col].astype("category").cat.codes
+    combined = combined.fillna(combined.median(numeric_only=True))
+
+    scaled = StandardScaler().fit_transform(combined)
+    embedding = umap.UMAP(random_state=random_state).fit_transform(scaled)
+
+    n_c = len(df_c)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(embedding[:n_c, 0], embedding[:n_c, 1], s=8, alpha=0.5,
+               label=label_candidat, color="#1976D2")
+    ax.scatter(embedding[n_c:, 0], embedding[n_c:, 1], s=8, alpha=0.5,
+               label="X (cible)", color="#F44336")
+    ax.set_title(f"Projection UMAP — X vs {label_candidat}")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    # --- Exemple d'enchaînement complet ---
+    # from selection_dataframe_entrainement import evaluer_candidat, psi_par_variable, variables_communes
+    # from selection_dataframe_mmd import evaluer_candidat_mmd
+
+    # resultat_a = evaluer_candidat("A", df_x, df_a)
+    # resultat_b = evaluer_candidat("B", df_x, df_b)
+    # plot_comparaison_candidats([resultat_a, resultat_b], metrique="score_similarite")
+
+    # variables = variables_communes(df_x, df_a)
+    # psi_df_a = psi_par_variable(df_x, df_a, variables)
+    # plot_psi(psi_df_a, titre="PSI — Candidat A vs X")
+
+    # plot_projection_2d(df_x, df_a, variables, label_candidat="A")
+    pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+Méthode alternative : comparaison des dataframes via Maximum Mean Discrepancy (MMD)
+
+Contrairement à la validation adversariale (classifieur) ou au PSI (univarié),
+le MMD mesure directement l'écart entre deux distributions multivariées dans un
+espace de noyau (RBF), sans entraîner de modèle. Il capture les interactions
+entre variables, pas seulement les marginales.
+
+Nécessite : numpy, pandas, scikit-learn, scipy
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import rbf_kernel
+
+
+def preparer_donnees(df_x: pd.DataFrame, df_candidat: pd.DataFrame, variables: list,
+                      n_max: int = 3000, random_state: int = 42):
+    """
+    Restreint aux variables communes, encode les catégorielles,
+    standardise (indispensable pour un noyau RBF), et retourne deux
+    matrices numpy comparables.
+
+    n_max : le calcul du MMD est en O(n^2) en mémoire (matrice n x n).
+    Au-delà de quelques milliers de lignes, la matrice devient trop
+    grosse (ex: 50 000 lignes -> matrice de 20 Go). On sous-échantillonne
+    donc chaque dataframe à n_max lignes max ; un échantillon aléatoire
+    suffit largement pour estimer une distance entre distributions.
+    """
+    df_candidat = (df_candidat.sample(n=n_max, random_state=random_state)
+                   if len(df_candidat) > n_max else df_candidat)
+    df_x = (df_x.sample(n=n_max, random_state=random_state)
+            if len(df_x) > n_max else df_x)
+
+    X_c = df_candidat[variables].copy()
+    X_x = df_x[variables].copy()
+
+    combined = pd.concat([X_c, X_x], axis=0, ignore_index=True)
+    for col in combined.select_dtypes(include=["object", "category"]).columns:
+        combined[col] = combined[col].astype("category").cat.codes
+
+    combined = combined.fillna(combined.median(numeric_only=True))
+
+    scaler = StandardScaler()
+    combined_scaled = scaler.fit_transform(combined)
+
+    n_c = len(X_c)
+    return combined_scaled[:n_c], combined_scaled[n_c:]
+
+
+def mmd_rbf(A: np.ndarray, B: np.ndarray, gamma: float = None) -> float:
+    """
+    Calcule le MMD^2 (estimateur non biaisé) entre deux échantillons A et B
+    avec un noyau RBF. Plus la valeur est proche de 0, plus les distributions
+    sont similaires.
+    """
+    if gamma is None:
+        # heuristique standard : inverse de la dimensionnalité
+        gamma = 1.0 / A.shape[1]
+
+    K_AA = rbf_kernel(A, A, gamma=gamma)
+    K_BB = rbf_kernel(B, B, gamma=gamma)
+    K_AB = rbf_kernel(A, B, gamma=gamma)
+
+    n, m = len(A), len(B)
+    np.fill_diagonal(K_AA, 0)
+    np.fill_diagonal(K_BB, 0)
+
+    mmd2 = (K_AA.sum() / (n * (n - 1))
+            + K_BB.sum() / (m * (m - 1))
+            - 2 * K_AB.mean())
+    return float(mmd2)
+
+
+def test_permutation_mmd(A: np.ndarray, B: np.ndarray, n_permutations: int = 200,
+                          gamma: float = None, random_state: int = 42) -> dict:
+    """
+    Teste si le MMD observé est significativement différent de 0
+    (c.-à-d. si les deux distributions sont vraiment différentes)
+    via un test de permutation.
+    """
+    rng = np.random.default_rng(random_state)
+    observed = mmd_rbf(A, B, gamma=gamma)
+
+    combined = np.vstack([A, B])
+    n = len(A)
+    null_dist = []
+    for _ in range(n_permutations):
+        perm = rng.permutation(len(combined))
+        A_perm = combined[perm[:n]]
+        B_perm = combined[perm[n:]]
+        null_dist.append(mmd_rbf(A_perm, B_perm, gamma=gamma))
+
+    null_dist = np.array(null_dist)
+    p_value = float((null_dist >= observed).mean())
+
+    return {"mmd": observed, "p_value": p_value, "null_dist_mean": null_dist.mean(),
+            "null_dist": null_dist}
+
+
+def evaluer_candidat_mmd(nom: str, df_x: pd.DataFrame, df_candidat: pd.DataFrame,
+                          n_permutations: int = 200, n_max: int = 3000) -> dict:
+    """Évalue un candidat via MMD + test de permutation.
+
+    n_max : taille max de l'échantillon utilisé pour le calcul (voir
+    preparer_donnees) — à ajuster selon ta mémoire disponible. 3000-5000
+    est un bon compromis précision/mémoire sur un poste standard.
+    """
+    variables = sorted(set(df_x.columns) & set(df_candidat.columns))
+    A, B = preparer_donnees(df_x, df_candidat, variables, n_max=n_max)
+    resultat = test_permutation_mmd(A, B, n_permutations=n_permutations)
+    resultat["nom"] = nom
+    resultat["n_variables_communes"] = len(variables)
+    resultat["taille_echantillon"] = len(A)
+    return resultat
+
+
+if __name__ == "__main__":
+    # --- À adapter avec tes vrais dataframes ---
+    # df_x = pd.read_csv("X.csv")
+    # df_a = pd.read_csv("candidat_A.csv")
+    # df_b = pd.read_csv("candidat_B.csv")
+
+    # resultat_a = evaluer_candidat_mmd("A", df_x, df_a)
+    # resultat_b = evaluer_candidat_mmd("B", df_x, df_b)
+
+    # for r in (resultat_a, resultat_b):
+    #     print(f"\n=== Candidat {r['nom']} ===")
+    #     print(f"MMD (distance)     : {r['mmd']:.5f}  (proche de 0 = idéal)")
+    #     print(f"p-value            : {r['p_value']:.3f}  (>0.05 = pas de différence significative)")
+
+    # Le candidat avec le MMD le plus faible ET la p-value la plus élevée
+    # est distributionnellement le plus proche de X.
+    pass
+
