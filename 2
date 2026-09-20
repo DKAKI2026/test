@@ -342,6 +342,7 @@ def executer(df, resultats, save_path="modele_mortalite.pkl", out_csv="soumissio
     rapide=True : petit entraînement (1 graine, 3 plis, learning rate élevé) pour tester le code.
     Si ta variable s'appelle `résultats` (avec accent), appelle : executer(df, résultats)
     """
+    df = verifier_donnees(df, resultats)   
     part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
     mode = "interleaved" if part > 0.9 else "temporal"
     print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
