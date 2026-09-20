@@ -201,7 +201,43 @@ def predict(bundle, resultats):
     sub["DthAmt"] = np.clip((w * te_a + (1 - w) * b_te) * bundle["f_a"], 0, None)
     return sub
 
-
+# ---- Contrôle des données (valeurs manquantes / infinies) -----------------------------------
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+ 
+ 
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+ 
+ 
+def verifier_donnees(df, resultats=None, verbose=True):
+    """
+    Rapport sur les valeurs manquantes / infinies, puis nettoyage de df :
+      - df : les lignes inutilisables (colonne critique ou cible manquante) sont RETIRÉES de l'entraînement.
+      - resultats : on ne peut pas inventer une prédiction -> erreur claire si une colonne critique est invalide.
+    Renvoie df nettoyé.
+    """
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + TARGETS), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques")
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), (
+            f"{int(bad_r.sum())} lignes de resultats ont une valeur manquante/infinie dans {CRITIQUES} "
+            f"(exemple d'index : {list(resultats.index[bad_r][:5])}). Impossible de predire ces lignes : corrige-les ou retire-les.")
+    bad = _lignes_invalides(df, CRITIQUES + TARGETS)
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement (valeur manquante/infinie).")
+        df = df.loc[~bad]
+    return df
 # ============================================================================================
 # SECTION 7 — Pipeline d'entraînement : run(df)
 # ============================================================================================
