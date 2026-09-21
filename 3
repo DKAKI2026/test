@@ -1,0 +1,1168 @@
+# -*- coding: utf-8 -*-
+
+import math
+import pickle
+import time
+from statistics import NormalDist
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================================================
+# SECTION 1 — Constantes et colonnes dérivées
+# ============================================================================================
+N_PLEIN = 3006          # décès pour une crédibilité de 100 %
+COMPLEMENT = "aucun"    # "aucun" : facteur = Z x ratio | "global" : + (1-Z) x ratio global de df | "un" : + (1-Z) x 1,000
+
+# 10 = T10+T20 et 11 = UL (3,4,5) n'existent que pour 2009-2011 -> groupes cohérents sur toutes les années
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+DUR_BINS = [1, 2, 3, 4, 5, 6, 11, 16, 21, 26, 10 ** 6]
+DUR_LABELS = ["1", "2", "3", "4", "5", "6-10", "11-15", "16-20", "21-25", "26+"]
+AGE_BINS = [0, 20, 30, 40, 50, 60, 70, 80, 90, 10 ** 6]
+AGE_LABELS = ["0-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80-89", "90+"]
+
+COLONNES_DERIVEES = ["Periode", "YearStart", "PolGrp", "DurBand", "AgeBand", "IssueAgeBand"]
+
+
+def preparer_strates(d):
+    """Ajoute les colonnes dérivées : Periode (2009-2010...), PolGrp (types de police regroupés),
+    DurBand (tranche de PolYear), AgeBand (tranche d'âge atteint), IssueAgeBand (tranche d'âge à l'émission)."""
+    d = d.copy()
+    d["YearStart"] = pd.to_numeric(d["Year"]).astype(int) // 100 + 2000        # 910 -> 2009, 2223 -> 2022
+    d["Periode"] = d["YearStart"].astype(str) + "-" + (d["YearStart"] + 1).astype(str)
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    pol = pd.to_numeric(d["PolYear"]).clip(lower=1)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    age = d["AttdAge"]
+    d["DurBand"] = pd.cut(pol, DUR_BINS, labels=DUR_LABELS, right=False).astype(str)
+    d["AgeBand"] = pd.cut(pd.to_numeric(age).clip(lower=0), AGE_BINS, labels=AGE_LABELS, right=False).astype(str)
+    d["IssueAgeBand"] = pd.cut(pd.to_numeric(d["IssueAge"]).clip(lower=0), AGE_BINS, labels=AGE_LABELS, right=False).astype(str)
+    return d
+
+
+def colonnes_strate(df):
+    """Liste des colonnes que tu peux mettre dans STRATE."""
+    d = preparer_strates(df.head(50))
+    exclues = {"DthCnt", "DthAmt", "ExpecCnt", "ExpecAmt", "ExposCnt", "ExposAmt", "ExposAmt2"}
+    return [c for c in d.columns if c not in exclues]
+
+
+def _lignes_ok(d, cols):
+    ok = np.ones(len(d), dtype=bool)
+    for c in cols:
+        s = d[c]
+        if pd.api.types.is_numeric_dtype(s):
+            ok &= np.isfinite(s.to_numpy(float))
+        else:
+            ok &= s.notna().to_numpy() & (s.astype(str) != "nan").to_numpy()
+    return ok
+
+
+def _preparer_df(df, strate):
+    """df prêt à l'emploi : colonnes dérivées + retrait des lignes inutilisables (valeurs manquantes/infinies)."""
+    d = preparer_strates(df)
+    manque = [c for c in strate if c not in d.columns]
+    assert not manque, f"Colonnes de strate introuvables : {manque}. Colonnes possibles : {colonnes_strate(df)}"
+    for c in ("DthCnt", "DthAmt", "ExpecAmt"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    ok = _lignes_ok(d, ["DthCnt", "DthAmt", "ExpecAmt"] + list(strate))
+    if (~ok).any():
+        print(f"ATTENTION : {_n((~ok).sum())} lignes de df retirees (valeur manquante/infinie dans les colonnes utilisees).")
+    return d.loc[ok].reset_index(drop=True)
+
+
+def _n(x, nd=0):
+    """Nombre formaté avec espaces pour les milliers (ex. 12 345)."""
+    return f"{x:,.{nd}f}".replace(",", " ")
+
+
+def _pl(n, mot):
+    """'1 strate' / '2 strates' (accord du pluriel)."""
+    return f"{_n(n)} {mot}{'s' if int(n) > 1 else ''}"
+
+
+def credibilite(deces, n_plein=N_PLEIN):
+    """Z = 100 % si décès >= n_plein, sinon racine(décès / n_plein)."""
+    return np.minimum(1.0, np.sqrt(np.asarray(deces, float) / n_plein))
+
+
+def pdev(y, p):
+    """Déviance de Poisson moyenne (la métrique du défi). Plus petit = mieux."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+# ============================================================================================
+# SECTION 2 — Vérification de 3 006
+# ============================================================================================
+def verifier_3006(n_plein=N_PLEIN):
+    """Vérifie d'où vient 3 006, la règle de crédibilité et l'exemple chiffré de la diapo."""
+    print("== 1) D'où vient 3 006 ? seuil = (z / marge)^2 ==")
+    for p, marge in ((0.90, 0.03), (0.90, 0.05), (0.95, 0.05), (0.95, 0.03)):
+        z = NormalDist().inv_cdf((1 + p) / 2)
+        print(f"   confiance {p:.0%}, marge +/-{marge:.0%} : z = {z:.4f}  ->  {_n((z / marge) ** 2, 1):>8s} décès")
+    z90 = NormalDist().inv_cdf(0.95)
+    print(f"   => 3 006 correspond à 90 % de confiance et +/-3 % : ({z90:.4f} / 0.03)^2 = {_n((z90 / 0.03) ** 2, 1)} "
+          f"(avec z arrondi à 1.645 : {_n((1.645 / 0.03) ** 2, 1)}, soit 3 007 en arrondissant)")
+
+    print(f"\n== 2) Crédibilité Z = min(1 ; racine(décès / {_n(n_plein)})) ==")
+    for d in (10, 50, 100, 300, 480, 1000, 2000, n_plein, 5000):
+        print(f"   {_n(d):>6s} décès -> Z = {float(credibilite(d, n_plein)):6.1%}")
+    assert float(credibilite(n_plein, n_plein)) == 1.0 and float(credibilite(n_plein * 2, n_plein)) == 1.0
+    assert abs(float(credibilite(n_plein / 4, n_plein)) - 0.5) < 1e-12           # quart des décès -> 50 %
+
+    print("\n== 3) Exemple : 480 décès, ratio réel/prévu 0.85 ==")
+    z = float(credibilite(480, n_plein))
+    f_aucun, f_un = z * 0.85, z * 0.85 + (1 - z) * 1.0
+    print(f"   Z = racine(480/{n_plein}) = {z:.4f}")
+    print(f"   facteur = Z x ratio                    = {z:.4f} x 0.85                 = {f_aucun:.4f}   (COMPLEMENT = \"aucun\")")
+    print(f"   facteur = Z x ratio + (1-Z) x 1.000    = {z:.4f} x 0.85 + {1 - z:.4f} x 1.000 = {f_un:.4f}   (COMPLEMENT = \"un\")")
+    assert abs(f_aucun - 0.3397) < 1e-3 and abs(f_un - 0.9401) < 1e-3
+    print("   ✓ vérifications réussies")
+
+
+# ============================================================================================
+# SECTION 3 — Table des strates et facteurs
+# ============================================================================================
+def _table(d, strate, n_plein=N_PLEIN, complement=COMPLEMENT):
+    """Table des facteurs (d doit déjà être préparé). Renvoie (table, valeur de repli pour une strate inconnue)."""
+    cols = list(strate) or ["_tout"]
+    d2 = d.assign(_tout=0) if not strate else d
+    g = (d2.groupby(cols).agg(Lignes=("DthAmt", "size"), Deces=("DthCnt", "sum"),
+                              Attendu=("ExpecAmt", "sum"), Reel=("DthAmt", "sum")).reset_index())
+    ratio_global = float(d["DthAmt"].sum() / d["ExpecAmt"].sum())      # ratio réel/prévu de TOUTES les lignes de df
+    if complement == "aucun":
+        terme, comp = 0.0, ratio_global        # facteur = Z x ratio ; comp ne sert qu'aux strates absentes de df
+    elif complement == "global":
+        terme, comp = ratio_global, ratio_global
+    elif complement == "un":
+        terme, comp = 1.0, 1.0
+    else:
+        raise ValueError('COMPLEMENT doit valoir "aucun", "global" ou "un"')
+    g["Ratio"] = np.where(g["Attendu"] > 0, g["Reel"] / g["Attendu"].where(g["Attendu"] > 0, 1.0), comp)
+    g["Z"] = credibilite(g["Deces"], n_plein)
+    g["Facteur"] = g["Z"] * g["Ratio"] + (1 - g["Z"]) * terme
+    g["Poids"] = g["Attendu"] / g["Attendu"].sum()                    # part des prestations attendues
+    return g, comp
+
+
+def table_strates(df, strate, n_plein=N_PLEIN, complement=COMPLEMENT, afficher=True, max_lignes=40, criteres=True):
+    """
+    Montre les strates, leurs décès, la crédibilité et le facteur. RAPIDE : à relancer à chaque changement de STRATE.
+      Deces   = somme de DthCnt        Attendu = somme de ExpecAmt        Reel = somme de DthAmt
+      Ratio   = Reel / Attendu         Z = crédibilité                    Facteur = Z x Ratio + (1 - Z) x complément
+      Poids   = part de la strate dans les prestations attendues totales
+    """
+    d = _preparer_df(df, strate)
+    tab, comp = _table(d, strate, n_plein, complement)
+    if afficher:
+        z100 = tab["Z"] >= 1.0
+        formule = {"aucun": "facteur = Z x ratio", "global": f"facteur = Z x ratio + (1-Z) x {comp:.4f} (ratio global de df)",
+                   "un": "facteur = Z x ratio + (1-Z) x 1.000"}[complement]
+        print(f"Strate = {list(strate) or '(global)'} | {formule}")
+        print(f"{_n(len(tab))} strates | {_n(z100.sum())} à 100 % de crédibilité "
+              f"({z100.mean():.0%} des strates, {tab.loc[z100, 'Poids'].sum():.0%} des prestations attendues) | "
+              f"décès par strate : min {_n(tab['Deces'].min())}, médiane {_n(tab['Deces'].median())}, max {_n(tab['Deces'].max())}")
+        pauvres = tab["Z"] < 0.5
+        print(f"{_n(pauvres.sum())} strates avec Z < 50 % ({tab.loc[pauvres, 'Poids'].sum():.1%} des prestations attendues)")
+        ecart = (tab["Poids"] * tab["Facteur"]).sum() / (tab["Poids"] * tab["Ratio"]).sum() - 1
+        print(f"Facteur moyen (pondéré) vs ratio réel/prévu observé : {ecart:+.1%}")
+        aff = tab.sort_values("Deces", ascending=False).head(max_lignes)
+        print("\n" + aff.to_string(index=False, float_format=lambda x: f"{x:,.4f}" if abs(x) < 100 else f"{x:,.0f}"))
+        if len(tab) > max_lignes:
+            print(f"... ({len(tab) - max_lignes} autres strates ; le tableau complet est renvoyé)")
+        if criteres:
+            verifier_criteres(df, strate, n_plein, complement, d=d, tab=tab)
+    return tab
+
+
+def _appliquer(tab, comp, strate, d):
+    """Facteur de chaque ligne de d. Strate inconnue -> Z = 0 -> complément."""
+    cols = list(strate) or ["_tout"]
+    d2 = d.assign(_tout=0) if not strate else d
+    m = d2[cols].merge(tab[cols + ["Facteur"]], on=cols, how="left")
+    inconnu = m["Facteur"].isna().to_numpy()
+    f = m["Facteur"].fillna(comp).to_numpy(float)
+    return d["ExpecAmt"].to_numpy(float) * f, f, inconnu
+
+
+# ============================================================================================
+# SECTION 3bis — Vérification des critères de crédibilité (MESSAGES seulement : rien ne s'arrête)
+#   ✓ = vérifié     ⚠ = à noter / non vérifié     ℹ = information
+# ============================================================================================
+def _phi_erf(x):
+    """erf vectorisé (sans scipy) : Z(intervalle de confiance) = erf(r / (sigma_relatif * racine(2)))."""
+    return np.vectorize(math.erf)(np.asarray(x, float))
+
+
+def _agreger_colonnes(d, strate, tab, colonnes_somme):
+    """Somme de colonnes supplémentaires par strate, alignée sur les lignes de tab."""
+    cols = list(strate) or ["_tout"]
+    d2 = d.assign(_tout=0) if not strate else d
+    a = d2.groupby(cols).agg(**{c: (c, "sum") for c in colonnes_somme}).reset_index()
+    return tab[cols].merge(a, on=cols, how="left")
+
+
+def _crit_racine(ctx, msg):
+    tab, N = ctx["tab"], ctx["n_plein"]
+    z_recalcule = np.minimum(1.0, np.sqrt(tab["Deces"] / N))
+    ecart = float(np.abs(z_recalcule - tab["Z"]).max())
+    msg("✓" if ecart < 1e-12 else "⚠", f"Z = racine(décès / {_n(N)}) recalculé pour {_pl(len(tab), 'strate')} : écart maximal avec le tableau = {ecart:.1e}")
+    pleines = tab["Z"] >= 1.0
+    msg("ℹ", f"{_pl(pleines.sum(), 'strate')} à Z = 100 % avec {_n(N)} décès ({tab.loc[pleines, 'Poids'].sum():.0%} des prestations attendues)")
+    z_alt = np.where(tab["Deces"] < 100, 0.0, np.minimum(1.0, np.sqrt(tab["Deces"] / 1082)))
+    pleines_alt = z_alt >= 1.0
+    sous100 = tab["Deces"] < 100
+    msg("ℹ", f"Autre seuil connu : 1 082 décès (90 %, ±5 %) avec Z = 0 sous 100 décès -> {_pl(pleines_alt.sum(), 'strate')} à 100 % "
+             f"({tab.loc[pleines_alt, 'Poids'].sum():.0%} des prestations) et {_pl(sous100.sum(), 'strate')} sous 100 décès (Z = 0)")
+
+
+def _crit_intervalle(ctx, msg):
+    tab, d, N, strate = ctx["tab"], ctx["d"], ctx["n_plein"], ctx["strate"]
+    r = 0.03                                                    # marge de ±3 %
+    z_def = float(_phi_erf(r * math.sqrt(N) / math.sqrt(2)))     # Z = Pr(|observé - vrai| <= r x vrai), Poisson : sigma_rel = 1/racine(N)
+    msg("✓" if abs(z_def - 0.90) < 0.01 else "⚠", f"Définition : à {_n(N)} décès (nombre), Z(intervalle ±3 %) = {z_def:.1%} "
+        f"(cohérent avec 90 % de confiance)")
+    manque = [c for c in ("ExposCnt", "ExposAmt", "ExposAmt2") if c not in d.columns]
+    if manque:
+        msg("ℹ", f"colonnes {manque} absentes : ajustement pour la dispersion des capitaux ignoré")
+        return
+    x = d.copy()
+    for c in ("ExposCnt", "ExposAmt", "ExposAmt2"):
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    a = _agreger_colonnes(x, strate, tab, ["ExposCnt", "ExposAmt", "ExposAmt2"])
+    cv2 = (a["ExposAmt2"] * a["ExposCnt"] / a["ExposAmt"] ** 2).to_numpy(float)     # 1 = capitaux identiques
+    cv2 = np.where(np.isfinite(cv2) & (cv2 >= 1), cv2, 1.0)
+    seuil_montant = N * cv2                                       # décès pour une crédibilité pleine SUR LE MONTANT
+    z_sqrt = tab["Z"].to_numpy(float)
+    z_ajuste = np.minimum(1.0, np.sqrt(tab["Deces"].to_numpy(float) / seuil_montant))
+    w = tab["Poids"].to_numpy(float)
+    msg("ℹ", f"Dispersion des capitaux (cv2, 1 = tous identiques) : médiane {np.median(cv2):.2f}, max {cv2.max():.2f} "
+             f"-> décès requis pour Z = 100 % sur le MONTANT : médiane {_n(np.median(seuil_montant))}")
+    ecart = z_sqrt - z_ajuste
+    moins = ecart > 0.10
+    msg("⚠" if moins.any() else "✓", f"{_pl(moins.sum(), 'strate')} ({w[moins].sum():.1%} des prestations) {'ont' if moins.sum() > 1 else 'a'} un Z (nombre de décès) supérieur de plus de "
+        f"10 points au Z ajusté à la dispersion des capitaux ; Z moyen pondéré : {np.average(z_sqrt, weights=w):.1%} (nombre) contre "
+        f"{np.average(z_ajuste, weights=w):.1%} (ajusté montant)")
+
+
+def _crit_whitney(ctx, msg):
+    tab, N = ctx["tab"], ctx["n_plein"]
+    K = N / 4                                                      # Z = 50 % quand décès = N/4, comme la racine carrée
+    ok = abs(K / (K + K) - 0.5) < 1e-12 and abs(math.sqrt(K / N) - 0.5) < 1e-12
+    msg("✓" if ok else "⚠", f"Formule N/(N+K) avec K = {_n(K, 1)} : Z = 50 % à {_n(K, 1)} décès, comme la racine carrée")
+    msg("ℹ", f"K = {_n(N / 9, 1)} donnerait Z = 90 % à {_n(N)} décès ; avec K = {_n(K, 1)}, Z({_n(N)} décès) = {N / (N + K):.0%} "
+             f"(la racine carrée atteint 100 %)")
+    z_w = tab["Deces"] / (tab["Deces"] + K)
+    ecart = float(np.average(np.abs(tab["Z"] - z_w), weights=tab["Poids"]))
+    msg("ℹ", f"Écart moyen pondéré |Z racine - Z Whitney| sur tes strates : {ecart:.1%}")
+
+
+def _crit_buhlmann(ctx, msg):
+    d, tab, strate = ctx["d"], ctx["tab"], ctx["strate"]
+    msg("ℹ", "Méthode publiée (Hardy et Panjer, 1998) pour des ratios de mortalité par rapport à une table standard ; "
+             "estimation ci-dessous sur tes strates (groupes) et tes lignes (observations), pondérées par ExpecAmt")
+    x = d.assign(_tout=0) if not strate else d
+    x = x[x["ExpecAmt"] > 0]
+    g = x.groupby(list(strate) or ["_tout"], sort=False).ngroup().to_numpy()
+    r, n = int(g.max()) + 1, len(x)
+    if r < 2 or n <= r:
+        msg("⚠", "Bühlmann-Straub non applicable : il faut au moins 2 strates et plusieurs lignes par strate")
+        return
+    m = x["ExpecAmt"].to_numpy(float)
+    X = (x["DthAmt"] / x["ExpecAmt"]).to_numpy(float)
+    mj = np.bincount(g, weights=m)
+    Xj = np.bincount(g, weights=m * X) / mj
+    mtot = mj.sum()
+    Xbar = float((mj * Xj).sum() / mtot)
+    v = float(np.bincount(g, weights=m * (X - Xj[g]) ** 2).sum() / (n - r))          # variance à l'intérieur des strates
+    a = float(((mj * (Xj - Xbar) ** 2).sum() - (r - 1) * v) / (mtot - (mj ** 2).sum() / mtot))   # variance entre strates
+    if not (a > 0 and np.isfinite(a) and np.isfinite(v)):
+        msg("⚠", f"variance entre strates estimée <= 0 (a = {a:.3g}) : Bühlmann-Straub non applicable ici "
+                 "(les strates ne diffèrent pas plus que le hasard) -> aucun Z calculé")
+        return
+    k = v / a
+    z_bs = mj / (mj + k)
+    deces_par_montant = float(x["DthCnt"].sum() / mtot)               # décès par unité de prestation attendue
+    d50 = k * deces_par_montant
+    msg("✓", f"k = v/a = {v:.3g} / {a:.3g} = {k:.3g} (en montant attendu) ; Z = 50 % à environ {_n(d50)} décès équivalents "
+             f"(racine carrée : {_n(ctx['n_plein'] / 4)} décès)")
+    poids = mj / mtot
+    msg("ℹ", f"Z Bühlmann-Straub : minimum {z_bs.min():.1%}, médiane {np.median(z_bs):.1%}, moyenne pondérée {np.average(z_bs, weights=poids):.1%} ; "
+             f"{_pl((z_bs >= 0.9).sum(), 'strate')} >= 90 %")
+
+
+def _crit_bayes(ctx, msg):
+    d, tab, strate = ctx["d"], ctx["tab"], ctx["strate"]
+    if "ExpecCnt" not in d.columns:
+        msg("ℹ", "colonne ExpecCnt absente : vérification ignorée")
+        return
+    x = d.copy()
+    x["ExpecCnt"] = pd.to_numeric(x["ExpecCnt"], errors="coerce")
+    a = _agreger_colonnes(x, strate, tab, ["ExpecCnt"])
+    E = a["ExpecCnt"].to_numpy(float)
+    D = tab["Deces"].to_numpy(float)
+    ok = np.isfinite(E) & (E > 0)
+    E, D, w = E[ok], D[ok], tab["Poids"].to_numpy(float)[ok]
+    if len(E) < 2:
+        msg("⚠", "Bayésienne (Poisson-Gamma) non applicable : il faut au moins 2 strates")
+        return
+    mu = D.sum() / E.sum()                                           # hypothèse de départ : ratio global
+    R = D / E
+    tau2 = ((E * (R - mu) ** 2).sum() - mu * (len(E) - 1)) / (E.sum() - (E ** 2).sum() / E.sum())
+    if not (tau2 > 0 and np.isfinite(tau2)):
+        msg("⚠", "variance entre strates estimée <= 0 : approche bayésienne sans effet ici (les strates ne diffèrent pas plus que le hasard)")
+        return
+    beta = mu / tau2                                                 # force de l'hypothèse de départ, en décès attendus
+    Z = E / (E + beta)
+    post = Z * R + (1 - Z) * mu
+    entre = bool(np.all((post >= np.minimum(mu, R) - 1e-12) & (post <= np.maximum(mu, R) + 1e-12)))
+    msg("✓" if entre else "⚠", f"Loi a priori Gamma (moyenne = ratio global {mu:.4f}, variance entre strates {tau2:.3g}) : le résultat est "
+        f"{'toujours' if entre else 'PAS toujours'} entre l'hypothèse de départ et le ratio observé")
+    msg("ℹ", f"Z bayésien : Z = 50 % à environ {_n(beta * mu)} décès ; moyenne pondérée {np.average(Z, weights=w):.1%} "
+             f"(racine carrée : {np.average(tab['Z'].to_numpy(float)[ok], weights=w):.1%})")
+
+
+def verifier_criteres(df, strate, n_plein=N_PLEIN, complement=COMPLEMENT, d=None, tab=None):
+    """
+    Vérifie, en MESSAGES seulement, les critères de crédibilité connus sur tes strates. Une vérification qui échoue
+    (ou qui est impossible) affiche un ⚠ et le code continue : rien ne s'arrête.
+      1) fluctuation limitée, racine carrée     4) Bühlmann / Bühlmann-Straub
+      2) fluctuation limitée, intervalle de confiance     5) bayésienne (Poisson-Gamma)
+      3) formule de Whitney N/(N+K)
+    """
+    print("\n== Vérifications des critères de crédibilité (messages seulement) ==")
+    print("   ✓ vérifié | ⚠ à noter ou non vérifié | ℹ information")
+    try:
+        if d is None:
+            d = _preparer_df(df, strate)
+        if tab is None:
+            tab = _table(d, strate, n_plein, complement)[0]
+    except Exception as e:                                          # même la préparation ne doit rien arrêter
+        print(f"   ⚠ préparation impossible ({type(e).__name__}: {e}) : aucune vérification effectuée")
+        return
+    ctx = dict(d=d, tab=tab, strate=list(strate), n_plein=n_plein)
+    bilan = {"✓": 0, "⚠": 0, "ℹ": 0}
+
+    def msg(symbole, texte):
+        bilan[symbole] += 1
+        print(f"   {symbole} {texte}")
+
+    for titre, fonction in (("1) Fluctuation limitée, racine carrée", _crit_racine),
+                            ("2) Fluctuation limitée, intervalle de confiance", _crit_intervalle),
+                            ("3) Formule de Whitney N/(N+K)", _crit_whitney),
+                            ("4) Bühlmann / Bühlmann-Straub", _crit_buhlmann),
+                            ("5) Bayésienne (Poisson-Gamma)", _crit_bayes)):
+        print(f" {titre}")
+        try:
+            fonction(ctx, msg)
+        except Exception as e:
+            msg("⚠", f"vérification impossible ({type(e).__name__}: {e})")
+    print(f" Bilan : ✓ {bilan['✓']} | ⚠ {bilan['⚠']} | ℹ {bilan['ℹ']}")
+
+
+# ============================================================================================
+# SECTION 4 — Validation rapide (déviance de Poisson hors-pli, en quelques secondes)
+# ============================================================================================
+def _plis(d, mode, n_splits=5, seed=42):
+    if mode == "melange":                          # les lignes à prédire sont mélangées avec celles de df
+        parts = np.array_split(np.random.default_rng(seed).permutation(len(d)), n_splits)
+        return [(np.concatenate([p for j, p in enumerate(parts) if j != k]), parts[k]) for k in range(n_splits)]
+    ys = np.sort(d["YearStart"].unique())[-3:]     # "futur" : on valide sur chacune des 3 dernières années
+    yr = d["YearStart"].to_numpy()
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+def detecter_mode(df, resultats):
+    """'melange' si les années de resultats existent déjà dans df, sinon 'futur'."""
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    return "melange" if part > 0.9 else "futur"
+
+
+def evaluer(df, strate, mode="melange", resultats=None, n_plein=N_PLEIN, complement=COMPLEMENT, n_splits=5, afficher=True):
+    """
+    Déviance de Poisson hors-pli du montant : table de mortalité seule vs facteur par strate.
+    mode="melange" ou "futur" (ou passe resultats=... pour le détecter automatiquement).
+    """
+    if resultats is not None:
+        mode = detecter_mode(df, resultats)
+    d = _preparer_df(df, strate)
+    oof = np.full(len(d), np.nan)
+    for tr, va in _plis(d, mode, n_splits):
+        tab, comp = _table(d.iloc[tr], strate, n_plein, complement)
+        oof[va] = _appliquer(tab, comp, strate, d.iloc[va])[0]
+    cov = ~np.isnan(oof)
+    y, e = d["DthAmt"].to_numpy(float)[cov], d["ExpecAmt"].to_numpy(float)[cov]
+    res = dict(mode=mode, strate=list(strate), deviance_ica=pdev(y, e), deviance=pdev(y, oof[cov]))
+    res["gain"] = 1 - res["deviance"] / res["deviance_ica"]
+    res["somme_pred_sur_reel"] = float(oof[cov].sum() / y.sum())
+    if afficher:
+        print(f"[{mode}] strate = {list(strate) or '(global)'} : déviance table de mortalité = {_n(res['deviance_ica'])} | "
+              f"avec facteur = {_n(res['deviance'])} | gain = {res['gain']:.1%} | somme prédite/réelle = {res['somme_pred_sur_reel']:.3f}")
+    return res
+
+
+def comparer_strates(df, strates, mode="melange", resultats=None, n_plein=N_PLEIN, complement=COMPLEMENT):
+    """Compare plusieurs listes de colonnes de strate d'un coup.  strates = {"nom": [colonnes], ...}"""
+    if resultats is not None:
+        mode = detecter_mode(df, resultats)
+    lignes = []
+    for nom, cols in strates.items():
+        r = evaluer(df, cols, mode, None, n_plein, complement, afficher=False)
+        tab = _table(_preparer_df(df, cols), cols, n_plein, complement)[0]
+        lignes.append({"Strate": nom, "Colonnes": ", ".join(cols) or "(global)", "Nb strates": len(tab),
+                       "Z=100 % (% des prestations)": tab.loc[tab["Z"] >= 1, "Poids"].sum(),
+                       "Déviance hors-pli": r["deviance"], "Gain vs table": r["gain"]})
+    t = pd.DataFrame(lignes).sort_values("Déviance hors-pli").reset_index(drop=True)
+    print(f"Mode de validation : {mode}")
+    print(t.to_string(index=False, float_format=lambda x: f"{x:,.4f}" if abs(x) < 100 else f"{x:,.0f}"))
+    return t
+
+
+def comparer_complements(df, strate, mode="melange", resultats=None, n_plein=N_PLEIN):
+    """Mesure l'effet du complément : "aucun" (Z x ratio), "global" et "un", en déviance de Poisson hors-pli."""
+    if resultats is not None:
+        mode = detecter_mode(df, resultats)
+    lignes = []
+    for comp in ("aucun", "global", "un"):
+        r = evaluer(df, strate, mode, None, n_plein, comp, afficher=False)
+        lignes.append({"Complément": comp, "Déviance hors-pli": r["deviance"], "Gain vs table": r["gain"],
+                       "Somme prédite / réelle": r["somme_pred_sur_reel"]})
+    t = pd.DataFrame(lignes)
+    print(f"Mode de validation : {mode} | strate = {list(strate) or '(global)'}")
+    print(t.to_string(index=False, float_format=lambda x: f"{x:,.4f}" if abs(x) < 100 else f"{x:,.0f}"))
+    return t
+
+
+# ============================================================================================
+# SECTION 5 — Prédiction du montant
+# ============================================================================================
+def predire_montant(df, resultats, strate, out_csv="soumission_montant.csv", n_plein=N_PLEIN,
+                    complement=COMPLEMENT, sep=",", decimal="."):
+    """
+    DthAmt prédit = ExpecAmt x facteur de la strate de la ligne. Écrit out_csv (resultats + colonne DthAmt).
+    Si ta variable s'appelle `résultats` (avec accent), appelle : predire_montant(df, résultats, STRATE)
+    Renvoie (resultats avec DthAmt, table des facteurs).
+    """
+    d = _preparer_df(df, strate)
+    tab, comp = _table(d, strate, n_plein, complement)
+    res = preparer_strates(resultats).reset_index(drop=True)
+    manque = [c for c in list(strate) + ["ExpecAmt"] if c not in res.columns]
+    assert not manque, f"Colonnes manquantes dans resultats : {manque}"
+    res["ExpecAmt"] = pd.to_numeric(res["ExpecAmt"], errors="coerce")
+    ok = _lignes_ok(res, ["ExpecAmt"] + list(strate))
+    assert ok.all(), (f"{int((~ok).sum())} lignes de resultats ont une valeur manquante/infinie dans ExpecAmt ou dans la strate "
+                      f"(index d'exemple : {list(resultats.index[~ok][:5])}). Impossible de les predire.")
+    amt, f, inconnu = _appliquer(tab, comp, strate, res)
+    sub = resultats.copy()
+    sub["DthAmt"] = amt
+    assert np.isfinite(amt).all(), "des predictions ne sont pas finies"
+    sub.to_csv(out_csv, index=False, sep=sep, decimal=decimal)
+    print(f"{_n(len(sub))} lignes prédites -> {out_csv}")
+    print(f"Facteur appliqué : min {f.min():.4f} | médiane {np.median(f):.4f} | max {f.max():.4f} | "
+          f"somme prédite / somme attendue = {amt.sum() / res['ExpecAmt'].sum():.4f}")
+    if inconnu.any():
+        print(f"ATTENTION : {_n(inconnu.sum())} lignes ({inconnu.mean():.1%}) ont une strate absente de df (Z = 0) -> "
+              f"facteur de repli = {comp:.4f} (ratio global de df, ou 1.000 si COMPLEMENT = \"un\").")
+    return sub, tab
+
+
+# ============================================================================================
+# SECTION 5bis — Entraînement d'un modèle (LightGBM, perte de Poisson) avec le facteur comme point de départ
+#   Le modèle apprend le RESTE à corriger :  DthAmt prédit = ExpecAmt x facteur x correction(colonnes du modèle)
+#   avec_facteur=False : point de départ = ExpecAmt seul (modèle sans facteur, pour mesurer l'apport du facteur).
+#   Le facteur d'une ligne d'entraînement est calculé SANS les lignes de son pli (hors-pli) : le modèle ne voit
+#   jamais la réponse de la ligne qu'il apprend.
+# ============================================================================================
+COLONNES_MODELE = ["Sex", "Smoke", "PolGrp", "Size", "Par", "Base", "PolYear", "AttdAge", "IssueAge"]   # modifiable
+PARAMS_MODELE = dict(objective="poisson", learning_rate=0.05, num_leaves=31, min_data_in_leaf=50,
+                     feature_fraction=0.9, lambda_l2=10.0, verbose=-1, seed=0)
+F_MIN = 1e-3                    # plancher du facteur utilisé comme point de départ (évite un point de départ nul)
+ORDRES = {"DurBand": DUR_LABELS, "AgeBand": AGE_LABELS, "IssueAgeBand": AGE_LABELS}
+
+
+def _lgb():
+    try:
+        import lightgbm as lgb
+    except ImportError as e:
+        raise ImportError("LightGBM n'est pas installé : pip install lightgbm") from e
+    return lgb
+
+
+def _mapping(d, feats):
+    """Codes entiers pour les colonnes non numériques (ex. DurBand, Periode), dans un ordre logique."""
+    m = {}
+    for c in feats:
+        if not pd.api.types.is_numeric_dtype(d[c]):
+            niveaux = ORDRES.get(c) or sorted(d[c].astype(str).unique())
+            m[c] = {v: i for i, v in enumerate(niveaux)}
+    return m
+
+
+def _X(d, feats, mapping):
+    X = d[feats].copy()
+    for c, mp in mapping.items():
+        X[c] = d[c].astype(str).map(mp).fillna(-1)
+    return X.astype(float)
+
+
+def _facteurs_oof(d, strate, n_plein, complement, n_splits=5, seed=0):
+    """Facteur de chaque ligne de d, calculé SANS les lignes de son pli (aucune fuite de la réponse)."""
+    f = np.ones(len(d))
+    for tr, va in _plis(d, "melange", n_splits, seed):
+        tab, comp = _table(d.iloc[tr], strate, n_plein, complement)
+        f[va] = _appliquer(tab, comp, strate, d.iloc[va])[1]
+    return f
+
+
+def _fit_lgb(dtr, Ftr, feats, mapping, params, dva=None, Fva=None, n_rounds=None, max_rounds=3000):
+    """Cible = DthAmt / (ExpecAmt x F), poids = ExpecAmt x F : minimise exactement la déviance de Poisson des montants."""
+    lgb = _lgb()
+
+    def prep(d, F):
+        E = d["ExpecAmt"].to_numpy(float) * np.maximum(F, F_MIN)
+        ok = E > 0
+        z = np.where(ok, d["DthAmt"].to_numpy(float) / np.where(ok, E, 1.0), 0.0)
+        w = E / E[ok].mean()
+        return _X(d, feats, mapping)[ok], z[ok], w[ok]
+
+    X, z, w = prep(dtr, Ftr)
+    dt = lgb.Dataset(X, z, weight=w)
+    if n_rounds is None:                                        # arrêt précoce sur le pli de validation
+        Xv, zv, wv = prep(dva, Fva)
+        b = lgb.train(params, dt, max_rounds, valid_sets=[lgb.Dataset(Xv, zv, weight=wv, reference=dt)],
+                      callbacks=[lgb.early_stopping(100, verbose=False)])
+        return b, int(b.best_iteration)
+    return lgb.train(params, dt, n_rounds), int(n_rounds)
+
+
+def _pred_lgb(b, best, d, F, feats, mapping):
+    E = d["ExpecAmt"].to_numpy(float) * np.maximum(F, F_MIN)
+    return E * b.predict(_X(d, feats, mapping), num_iteration=best)
+
+
+def _cv_modele(d, strate, feats, mapping, mode, n_splits, avec_facteur, n_plein, complement, params, verbose=True):
+    n = len(d)
+    oof_mod, oof_fac, meilleures = np.full(n, np.nan), np.full(n, np.nan), []
+    for k, (tr, va) in enumerate(_plis(d, mode, n_splits)):
+        t0 = time.time()
+        dtr, dva = d.iloc[tr], d.iloc[va]
+        tab, comp = _table(dtr, strate, n_plein, complement)
+        Fva = _appliquer(tab, comp, strate, dva)[1]                       # facteur des lignes de validation
+        oof_fac[va] = dva["ExpecAmt"].to_numpy(float) * Fva
+        Ftr = _facteurs_oof(dtr, strate, n_plein, complement) if avec_facteur else np.ones(len(dtr))
+        Fv = Fva if avec_facteur else np.ones(len(dva))
+        b, best = _fit_lgb(dtr, Ftr, feats, mapping, params, dva, Fv)
+        oof_mod[va] = _pred_lgb(b, best, dva, Fv, feats, mapping)
+        meilleures.append(best)
+        if verbose:
+            print(f"   pli {k + 1}/{n_splits} : {best} arbres, {time.time() - t0:.0f} s")
+    return oof_mod, oof_fac, meilleures
+
+
+def _rapport_modele(d, oof_mod, oof_fac, nom_modele):
+    cov = ~np.isnan(oof_mod)
+    y, e = d["DthAmt"].to_numpy(float)[cov], d["ExpecAmt"].to_numpy(float)[cov]
+    lignes = [("Table de mortalité seule", e), ("Facteur seul", oof_fac[cov]), (nom_modele, oof_mod[cov])]
+    ref = pdev(y, e)
+    print(f"   {'Méthode':<42s}{'Déviance hors-pli':>20s}{'Gain vs table':>15s}{'Somme prédite/réelle':>22s}")
+    res = {}
+    for nom, p in lignes:
+        dv = pdev(y, p)
+        res[nom] = dv
+        print(f"   {nom:<42s}{_n(dv):>20s}{1 - dv / ref:>15.1%}{p.sum() / y.sum():>22.3f}")
+    return res
+
+
+def _colonnes_modele(colonnes, mode):
+    """L'année n'est PAS une colonne du modèle (ni YearStart, ni Periode) : les prédictions ne dépendent
+    pas de l'année précédente ou suivante, seulement des caractéristiques de la ligne."""
+    return list(colonnes or COLONNES_MODELE)
+
+
+def comparer_modeles(df, strate, colonnes=None, mode="melange", resultats=None, n_plein=N_PLEIN, complement=COMPLEMENT,
+                     n_splits=5, rapide=False, params=None):
+    """Déviance de Poisson hors-pli : table seule / facteur seul / modèle SANS facteur / modèle AVEC facteur."""
+    _lgb()                                              # échoue tout de suite si LightGBM n'est pas installé
+    if resultats is not None:
+        mode = detecter_mode(df, resultats)
+    if rapide:
+        n_splits = 3
+    p = dict(PARAMS_MODELE, **(params or {}), **({"learning_rate": 0.15} if rapide else {}))
+    feats = _colonnes_modele(colonnes, mode)
+    d = _preparer_df(df, list(strate) + feats)
+    mapping = _mapping(d, feats)
+    print(f"Mode de validation : {mode} | strate = {list(strate) or '(global)'} | colonnes du modèle = {feats}")
+    sortie = {}
+    for avec in (False, True):
+        nom = "Modèle AVEC facteur (point de départ)" if avec else "Modèle SANS facteur"
+        print(f"\n-- {nom}")
+        om, of, _ = _cv_modele(d, strate, feats, mapping, mode, n_splits, avec, n_plein, complement, p)
+        sortie[avec] = (om, of)
+    cov = ~np.isnan(sortie[True][0])
+    y, e = d["DthAmt"].to_numpy(float)[cov], d["ExpecAmt"].to_numpy(float)[cov]
+    lignes = [("Table de mortalité seule", e), ("Facteur seul", sortie[True][1][cov]),
+              ("Modèle SANS facteur", sortie[False][0][cov]), ("Modèle AVEC facteur", sortie[True][0][cov])]
+    ref = pdev(y, e)
+    print("\n== Déviance de Poisson hors-pli du montant (plus petit = mieux) ==")
+    print(f"   {'Méthode':<32s}{'Déviance':>16s}{'Gain vs table':>15s}{'Somme prédite/réelle':>22s}")
+    for nom, pr in lignes:
+        dv = pdev(y, pr)
+        print(f"   {nom:<32s}{_n(dv):>16s}{1 - dv / ref:>15.1%}{pr.sum() / y.sum():>22.3f}")
+    return {nom: pdev(y, pr) for nom, pr in lignes}
+
+
+def entrainer_modele(df, strate, colonnes=None, avec_facteur=True, resultats=None, mode="melange", n_plein=N_PLEIN,
+                     complement=COMPLEMENT, n_splits=5, rapide=False, params=None, save_path="modele_montant.pkl"):
+    """
+    Entraîne le modèle du montant, en 3 étapes affichées :
+      1) résumé des strates et facteurs (secondes) : regarde-le avant que l'entraînement dure
+      2) validation hors-pli (donne aussi le bon nombre d'arbres)
+      3) entraînement final sur tout df, puis enregistrement dans save_path
+    Renvoie le modèle (bundle) à passer à predire_avec_modele().
+    """
+    _lgb()                                              # échoue tout de suite si LightGBM n'est pas installé
+    if resultats is not None:
+        mode = detecter_mode(df, resultats)
+    if rapide:
+        n_splits = 3
+    p = dict(PARAMS_MODELE, **(params or {}), **({"learning_rate": 0.15} if rapide else {}))
+    feats = _colonnes_modele(colonnes, mode)
+    d = _preparer_df(df, list(strate) + feats)
+    mapping = _mapping(d, feats)
+
+    print("== Étape 1/3 : strates et facteurs ==")
+    tab, comp = _table(d, strate, n_plein, complement)
+    z100 = tab["Z"] >= 1.0
+    print(f"   strate = {list(strate) or '(global)'} | {_pl(len(tab), 'strate')}, dont {_pl(z100.sum(), 'strate')} à 100 % de crédibilité "
+          f"({tab.loc[z100, 'Poids'].sum():.0%} des prestations attendues) | complément = {complement}")
+    print(f"   modèle : LightGBM (Poisson) | point de départ = {'ExpecAmt x facteur' if avec_facteur else 'ExpecAmt seul'} | colonnes = {feats}")
+
+    print(f"\n== Étape 2/3 : validation hors-pli ({mode}, {n_splits} plis) ==")
+    om, of, meilleures = _cv_modele(d, strate, feats, mapping, mode, n_splits, avec_facteur, n_plein, complement, p)
+    _rapport_modele(d, om, of, "Modèle (point de départ facteur)" if avec_facteur else "Modèle (sans facteur)")
+
+    print("\n== Étape 3/3 : entraînement final sur tout df ==")
+    n_rounds = max(50, int(1.1 * np.mean(meilleures)))
+    F_all = _facteurs_oof(d, strate, n_plein, complement) if avec_facteur else np.ones(len(d))
+    t0 = time.time()
+    b, best = _fit_lgb(d, F_all, feats, mapping, p, n_rounds=n_rounds)
+    print(f"   {best} arbres entraînés en {time.time() - t0:.0f} s")
+    bundle = dict(booster=b.model_to_string(num_iteration=best), feats=feats, mapping=mapping, strate=list(strate),
+                  avec_facteur=avec_facteur, n_plein=n_plein, complement=complement, tab=tab, comp=comp,
+                  n_arbres=best, mode=mode)
+    if save_path:
+        with open(save_path, "wb") as f:
+            pickle.dump(bundle, f)
+        print(f"   modèle enregistré : {save_path}")
+    return bundle
+
+
+def charger_modele(chemin="modele_montant.pkl"):
+    with open(chemin, "rb") as f:
+        return pickle.load(f)
+
+
+def predire_avec_modele(bundle, resultats, out_csv="soumission_montant_modele.csv", sep=",", decimal="."):
+    """DthAmt prédit = ExpecAmt x facteur (table de df) x correction du modèle. Écrit out_csv (resultats + DthAmt)."""
+    lgb = _lgb()
+    strate, feats = bundle["strate"], bundle["feats"]
+    res = preparer_strates(resultats).reset_index(drop=True)
+    manque = [c for c in list(strate) + feats + ["ExpecAmt"] if c not in res.columns]
+    assert not manque, f"Colonnes manquantes dans resultats : {manque}"
+    res["ExpecAmt"] = pd.to_numeric(res["ExpecAmt"], errors="coerce")
+    ok = _lignes_ok(res, ["ExpecAmt"] + list(strate))
+    assert ok.all(), (f"{int((~ok).sum())} lignes de resultats ont une valeur manquante/infinie dans ExpecAmt ou dans la strate "
+                      f"(index d'exemple : {list(resultats.index[~ok][:5])}). Impossible de les predire.")
+    _, f, inconnu = _appliquer(bundle["tab"], bundle["comp"], strate, res)
+    F = f if bundle["avec_facteur"] else np.ones(len(res))
+    b = lgb.Booster(model_str=bundle["booster"])
+    amt = _pred_lgb(b, None, res, F, feats, bundle["mapping"])
+    assert np.isfinite(amt).all(), "des predictions ne sont pas finies"
+    sub = resultats.copy()
+    sub["DthAmt"] = amt
+    sub.to_csv(out_csv, index=False, sep=sep, decimal=decimal)
+    print(f"{_n(len(sub))} lignes prédites avec le modèle -> {out_csv} | somme prédite / somme attendue = "
+          f"{amt.sum() / res['ExpecAmt'].sum():.4f}")
+    if inconnu.any():
+        print(f"ATTENTION : {_n(inconnu.sum())} lignes ({inconnu.mean():.1%}) ont une strate absente de df -> facteur de repli utilisé.")
+    return sub
+
+
+# ============================================================================================
+# SECTION 5ter — Variantes de GLM : comparaison hors-pli, meilleur modèle gardé, prédiction sur resultats
+#   Toutes les variantes minimisent une perte de type Poisson avec point de départ ExpecAmt (offset log(ExpecAmt)),
+#   sauf Tweedie. Elles sont comparées sur les MÊMES plis, en déviance de Poisson du montant.
+#     "tranches"          : effets par niveau (sexe, fumeur, ..., tranches de durée et d'âge) -> facteurs par table
+#     "splines"           : courbes lisses sur l'âge atteint, la durée (et l'année si mode "melange")
+#     "splines + inter"   : splines + interactions (liste INTERACTIONS)
+#     ridge (alpha)       : pénalité qui rapproche de 1,000 les facteurs peu observés (crédibilité intégrée)
+#     "Tweedie"           : perte adaptée aux montants très variables (évaluée quand même en déviance de Poisson)
+#     "GLM + LightGBM"    : le meilleur GLM sert de point de départ, LightGBM apprend le reste (moins explicable)
+# ============================================================================================
+ALPHAS = (1e-5, 1e-4, 1e-3, 1e-2)                                  # forces de la pénalité ridge testées
+INTERACTIONS = [("Smoke", "Sex"), ("Smoke", "Size"), ("PolGrp", "Size"), ("Smoke", "PolGrp")]   # modifiable
+COLS_CAT = ["Sex", "Smoke", "PolGrp", "Size", "Par", "Base"]
+COLS_BANDES = ["DurBand", "AgeBand"]
+COLS_SPLINE = ["AttdAge", "PolYear"]
+RATIO_MIN, RATIO_MAX = 1e-3, 1e2                                    # garde-fou sur le rapport prédit / attendu
+
+
+def _sk():
+    try:
+        import sklearn  # noqa: F401
+    except ImportError as e:
+        raise ImportError("scikit-learn n'est pas installé : pip install scikit-learn") from e
+
+
+def _nom_inter(a, b):
+    return f"{a}_x_{b}"
+
+
+def _ajouter_interactions(d, interactions):
+    d = d.copy()
+    for a, b in interactions:
+        d[_nom_inter(a, b)] = d[a].astype(str) + "|" + d[b].astype(str)
+    return d
+
+
+def _colonnes_glm(design, mode, interactions):
+    """L'année n'est PAS une colonne du GLM (ni YearStart, ni Periode)."""
+    cat = list(COLS_CAT)
+    num = []
+    if design == "tranches":
+        cat += COLS_BANDES
+    else:
+        num = list(COLS_SPLINE)
+        if design == "splines+inter":
+            cat += [_nom_inter(a, b) for a, b in interactions]
+    return cat, num
+
+
+def _variantes(alphas, avec_tweedie=True):
+    v = []
+    for design, etiquette in (("tranches", "tranches"), ("splines", "splines"), ("splines+inter", "splines + interactions")):
+        for a in alphas:
+            v.append(dict(nom=f"GLM {etiquette} (ridge {a:g})", design=design, alpha=a, famille="poisson"))
+    if avec_tweedie:
+        v.append(dict(nom="GLM Tweedie p=1.5, splines (ridge 0.0001)", design="splines", alpha=1e-4, famille="tweedie", power=1.5))
+    return v
+
+
+def _pipeline(var, mode, interactions):
+    _sk()
+    from sklearn.compose import ColumnTransformer
+    from sklearn.linear_model import PoissonRegressor, TweedieRegressor
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    cat, num = _colonnes_glm(var["design"], mode, interactions)
+    blocs = [("cat", OneHotEncoder(handle_unknown="ignore"), cat)]
+    if num:
+        blocs.append(("spl", SplineTransformer(n_knots=6, degree=3, extrapolation="constant"), num))
+    if var["famille"] == "poisson":
+        est = PoissonRegressor(alpha=var["alpha"], max_iter=500, tol=1e-7)
+    else:
+        est = TweedieRegressor(power=var.get("power", 1.5), link="log", alpha=var["alpha"], max_iter=500, tol=1e-7)
+    return Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)), ("glm", est)]), cat + num
+
+
+def _ajuster_glm(d, var, mode, interactions):
+    """Ajuste une variante : cible z = DthAmt/ExpecAmt, poids = ExpecAmt (Poisson avec offset) ou ExpecAmt^(2-p) (Tweedie)."""
+    import warnings
+    pipe, cols = _pipeline(var, mode, interactions)
+    E = d["ExpecAmt"].to_numpy(float)
+    ok = E > 0
+    z = d["DthAmt"].to_numpy(float)[ok] / E[ok]
+    sw = E[ok] if var["famille"] == "poisson" else E[ok] ** (2 - var.get("power", 1.5))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pipe.fit(d.loc[ok, cols], z, glm__sample_weight=sw)
+    return pipe, cols
+
+
+def _ratio_glm(pipe, cols, d):
+    """Rapport prédit / attendu de la variante (>= 0, borné)."""
+    return np.clip(pipe.predict(d[cols]), RATIO_MIN, RATIO_MAX)
+
+
+def _glm_ratios_oof(d, var, mode, interactions, n_inner=3, seed=0):
+    """Rapport du GLM pour chaque ligne de d, calculé SANS les lignes de son pli (sert de point de départ à LightGBM)."""
+    r = np.ones(len(d))
+    for tr, va in _plis(d, "melange", n_inner, seed):
+        pipe, cols = _ajuster_glm(d.iloc[tr], var, mode, interactions)
+        r[va] = _ratio_glm(pipe, cols, d.iloc[va])
+    return r
+
+
+def _preparer_glm(df, mode, interactions):
+    besoin = list(dict.fromkeys(COLS_CAT + COLS_BANDES + COLS_SPLINE + ["Periode", "YearStart"] + [c for p in interactions for c in p]))
+    d = _preparer_df(df, besoin)
+    return _ajouter_interactions(d, interactions)
+
+
+def comparer_glm(df, resultats=None, mode="melange", strate=None, n_plein=N_PLEIN, complement=COMPLEMENT, n_splits=5,
+                 rapide=False, avec_lightgbm=True, avec_tweedie=True, interactions=None, alphas=None, params=None,
+                 seulement_glm=False, afficher=True):
+    """
+    Compare les variantes de GLM (et GLM + LightGBM) en déviance de Poisson hors-pli du montant, sur les mêmes plis.
+    strate : (optionnel) liste de colonnes pour ajouter la ligne « facteur par strate » au tableau.
+    seulement_glm=True : le « meilleur » est choisi parmi les GLM purs seulement (formule explicite).
+    Renvoie un dict : table, meilleur (nom), variantes, ... à passer à entrainer_meilleur().
+    """
+    _sk()
+    if resultats is not None:
+        mode = detecter_mode(df, resultats)
+    interactions = INTERACTIONS if interactions is None else interactions
+    if rapide:
+        n_splits = 3
+        alphas = alphas or (1e-4, 1e-2)
+    alphas = alphas or ALPHAS
+    d = _preparer_glm(df, mode, interactions)
+    variantes = _variantes(alphas, avec_tweedie)
+    plis = _plis(d, mode, n_splits)
+    n = len(d)
+    y, E = d["DthAmt"].to_numpy(float), d["ExpecAmt"].to_numpy(float)
+    oof = {}
+    if afficher:
+        print(f"Mode de validation : {mode} ({n_splits} plis) | {_pl(len(variantes), 'variante')} de GLM | {_pl(n, 'ligne')}")
+    for var in variantes:
+        t0 = time.time()
+        o = np.full(n, np.nan)
+        for tr, va in plis:
+            pipe, cols = _ajuster_glm(d.iloc[tr], var, mode, interactions)
+            o[va] = E[va] * _ratio_glm(pipe, cols, d.iloc[va])
+        oof[var["nom"]] = o
+        if afficher:
+            print(f"   {var['nom']:<52s} {time.time() - t0:5.0f} s")
+    cov = ~np.isnan(oof[variantes[0]["nom"]])
+    dev = {nom: pdev(y[cov], o[cov]) for nom, o in oof.items()}
+    meilleur_glm = min(dev, key=dev.get)
+    var_glm = next(v for v in variantes if v["nom"] == meilleur_glm)
+
+    nom_stack, best_iters = None, None
+    if avec_lightgbm and not seulement_glm:
+        try:
+            _lgb()
+            t0 = time.time()
+            feats = _colonnes_modele(None, mode)
+            mapping = _mapping(d, feats)
+            p = dict(PARAMS_MODELE, **(params or {}), **({"learning_rate": 0.15} if rapide else {}))
+            nom_stack = f"GLM + LightGBM (point de départ : {meilleur_glm})"
+            o, best_iters = np.full(n, np.nan), []
+            for tr, va in plis:
+                dtr, dva = d.iloc[tr], d.iloc[va]
+                Ftr = _glm_ratios_oof(dtr, var_glm, mode, interactions)
+                pipe, cols = _ajuster_glm(dtr, var_glm, mode, interactions)
+                Fva = _ratio_glm(pipe, cols, dva)
+                b, best = _fit_lgb(dtr, Ftr, feats, mapping, p, dva, Fva)
+                o[va] = _pred_lgb(b, best, dva, Fva, feats, mapping)
+                best_iters.append(best)
+            oof[nom_stack] = o
+            dev[nom_stack] = pdev(y[cov], o[cov])
+            if afficher:
+                print(f"   {nom_stack[:52]:<52s} {time.time() - t0:5.0f} s")
+        except ImportError as e:
+            nom_stack = None
+            if afficher:
+                print(f"   (GLM + LightGBM ignoré : {e})")
+
+    ref = pdev(y[cov], E[cov])
+    lignes = [("Table de mortalité seule", ref, float((E[cov]).sum() / y[cov].sum()), "")]
+    if strate is not None:
+        dd = _preparer_df(df, list(strate))
+        of = np.full(len(dd), np.nan)
+        for tr, va in _plis(dd, mode, n_splits):
+            tab, comp = _table(dd.iloc[tr], strate, n_plein, complement)
+            of[va] = _appliquer(tab, comp, strate, dd.iloc[va])[0]
+        if len(dd) == n:
+            lignes.append((f"Facteur par strate {list(strate)}", pdev(y[cov], of[cov]), float(of[cov].sum() / y[cov].sum()), ""))
+    for nom, o in oof.items():
+        lignes.append((nom, dev[nom], float(o[cov].sum() / y[cov].sum()), "GLM + LightGBM" if nom == nom_stack else "GLM"))
+    table = pd.DataFrame(lignes, columns=["Méthode", "Déviance hors-pli", "Somme prédite / réelle", "Type"])
+    table["Gain vs table"] = 1 - table["Déviance hors-pli"] / ref
+    table["Rang"] = table["Déviance hors-pli"].rank(method="min").astype(int)
+    candidats = {k: v for k, v in dev.items() if k != nom_stack} if seulement_glm else dev
+    meilleur = min(candidats, key=candidats.get)
+    table["Retenu"] = table["Méthode"] == meilleur
+    if afficher:
+        aff = table.sort_values("Déviance hors-pli").reset_index(drop=True)
+        print("\n== Déviance de Poisson hors-pli du montant (plus petit = mieux) ==")
+        print(aff[["Méthode", "Déviance hors-pli", "Gain vs table", "Somme prédite / réelle", "Retenu"]].to_string(
+            index=False, formatters={"Déviance hors-pli": lambda x: _n(x), "Gain vs table": lambda x: f"{x:.1%}",
+                                     "Somme prédite / réelle": lambda x: f"{x:.3f}", "Retenu": lambda x: "<== meilleur" if x else ""}))
+        if meilleur == nom_stack:
+            print("\nNote : le meilleur est GLM + LightGBM (pas de formule explicite). Pour garder le meilleur GLM pur : seulement_glm=True.")
+        elif nom_stack is not None:
+            print(f"\nNote : GLM + LightGBM ({_n(dev[nom_stack])}) fait {'moins bien' if dev[nom_stack] >= dev[meilleur] else 'mieux'} que le meilleur GLM.")
+    return dict(table=table, meilleur=meilleur, variantes=variantes, mode=mode, interactions=interactions, meilleur_glm=meilleur_glm,
+                nom_stack=nom_stack, best_iters=best_iters, deviances=dev, params=params, rapide=rapide)
+
+
+def entrainer_meilleur(df, comparaison, save_path="meilleur_modele.pkl"):
+    """Entraîne sur tout df la variante retenue par comparer_glm() et l'enregistre. Renvoie le modèle (bundle)."""
+    _sk()
+    mode, interactions, nom = comparaison["mode"], comparaison["interactions"], comparaison["meilleur"]
+    d = _preparer_glm(df, mode, interactions)
+    est_stack = nom == comparaison["nom_stack"]
+    var = next(v for v in comparaison["variantes"] if v["nom"] == comparaison["meilleur_glm"])
+    print(f"== Entraînement final : {nom} ==")
+    t0 = time.time()
+    pipe, cols = _ajuster_glm(d, var, mode, interactions)
+    bundle = dict(nom=nom, variante=var, mode=mode, interactions=interactions, pipe=pipe, cols=cols, lgb=None)
+    if est_stack:
+        feats = _colonnes_modele(None, mode)
+        mapping = _mapping(d, feats)
+        p = dict(PARAMS_MODELE, **(comparaison.get("params") or {}), **({"learning_rate": 0.15} if comparaison.get("rapide") else {}))
+        F = _glm_ratios_oof(d, var, mode, interactions)
+        n_rounds = max(50, int(1.1 * np.mean(comparaison["best_iters"])))
+        b, best = _fit_lgb(d, F, feats, mapping, p, n_rounds=n_rounds)
+        bundle.update(lgb=b.model_to_string(num_iteration=best), feats=feats, mapping=mapping, n_arbres=best)
+        print(f"   GLM + {best} arbres LightGBM")
+    print(f"   terminé en {time.time() - t0:.0f} s")
+    if save_path:
+        with open(save_path, "wb") as f:
+            pickle.dump(bundle, f)
+        print(f"   modèle enregistré : {save_path}")
+    return bundle
+
+
+def predire_glm(bundle, resultats, out_csv="soumission_montant_glm.csv", sep=",", decimal="."):
+    """DthAmt prédit avec le modèle retenu (GLM, ou GLM + LightGBM). Écrit out_csv (resultats + colonne DthAmt)."""
+    res = _ajouter_interactions(preparer_strates(resultats).reset_index(drop=True), bundle["interactions"])
+    manque = [c for c in bundle["cols"] + ["ExpecAmt"] if c not in res.columns]
+    assert not manque, f"Colonnes manquantes dans resultats : {manque}"
+    res["ExpecAmt"] = pd.to_numeric(res["ExpecAmt"], errors="coerce")
+    ok = _lignes_ok(res, ["ExpecAmt"] + [c for c in bundle["cols"] if c in res.columns])
+    assert ok.all(), (f"{int((~ok).sum())} lignes de resultats ont une valeur manquante/infinie dans ExpecAmt ou dans une colonne du modèle "
+                      f"(index d'exemple : {list(resultats.index[~ok][:5])}). Impossible de les predire.")
+    ratio = _ratio_glm(bundle["pipe"], bundle["cols"], res)
+    if bundle["lgb"] is None:
+        amt = res["ExpecAmt"].to_numpy(float) * ratio
+    else:
+        b = _lgb().Booster(model_str=bundle["lgb"])
+        amt = _pred_lgb(b, None, res, ratio, bundle["feats"], bundle["mapping"])
+    assert np.isfinite(amt).all(), "des predictions ne sont pas finies"
+    sub = resultats.copy()
+    sub["DthAmt"] = amt
+    sub.to_csv(out_csv, index=False, sep=sep, decimal=decimal)
+    print(f"{_n(len(sub))} lignes prédites avec « {bundle['nom']} » -> {out_csv} | somme prédite / somme attendue = "
+          f"{amt.sum() / res['ExpecAmt'].sum():.4f}")
+    return sub
+
+
+def executer_glm(df, resultats, strate=None, seulement_glm=False, rapide=False, out_csv="soumission_montant_glm.csv",
+                 save_path="meilleur_modele.pkl", **kw):
+    """Tout en un : compare les variantes, garde le meilleur, l'entraîne sur tout df, prédit sur resultats, écrit le CSV.
+    Renvoie (modèle, prédictions, tableau de comparaison)."""
+    comp = comparer_glm(df, resultats=resultats, strate=strate, seulement_glm=seulement_glm, rapide=rapide, **kw)
+    print()
+    bundle = entrainer_meilleur(df, comp, save_path)
+    print()
+    sub = predire_glm(bundle, resultats, out_csv)
+    return bundle, sub, comp["table"]
+
+
+# ============================================================================================
+# SECTION 5quater — Tableau final : toutes les méthodes ensemble, meilleure gardée, prédiction sur resultats
+#   Rassemble, sur les MÊMES plis : facteur par strate, modèle LightGBM (avec/sans facteur), variantes de GLM.
+# ============================================================================================
+def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plein=N_PLEIN, complement=COMPLEMENT,
+                  n_splits=5, rapide=False, seulement_explicable=False, avec_lightgbm_seul=True, avec_glm=True,
+                  interactions=None, alphas=None, params=None):
+    """
+    Tableau unique avec la déviance de Poisson hors-pli de TOUTES les méthodes déjà vues dans ce fichier :
+      - table de mortalité seule                     - facteur par strate
+      - modèle LightGBM sans facteur / avec facteur   - variantes de GLM (+ GLM + LightGBM)
+    seulement_explicable=True : la « meilleure » retenue est choisie parmi facteur par strate et GLM pur seulement
+    (une formule ou des tables, sans LightGBM), même si un modèle LightGBM fait mieux.
+    Renvoie un dict à passer à entrainer_meilleur_de_tout() (mêmes options que comparer_glm/comparer_modeles).
+    """
+    mode = mode or detecter_mode(df, resultats)
+    if rapide:
+        n_splits = 3
+    feats = _colonnes_modele(colonnes_modele, mode)
+    d_lgb = _preparer_df(df, list(strate) + feats)
+    plis = _plis(d_lgb, mode, n_splits)
+    y, E = d_lgb["DthAmt"].to_numpy(float), d_lgb["ExpecAmt"].to_numpy(float)
+    n = len(d_lgb)
+    lignes, oof = [], {}
+
+    print(f"Mode de validation : {mode} ({n_splits} plis) | strate = {list(strate) or '(global)'} | {_pl(n, 'ligne')}\n")
+
+    print("-- Facteur par strate --")
+    o = np.full(n, np.nan)
+    for tr, va in plis:
+        tab, comp = _table(d_lgb.iloc[tr], strate, n_plein, complement)
+        o[va] = _appliquer(tab, comp, strate, d_lgb.iloc[va])[0]
+    oof["Facteur par strate"] = o
+    lignes.append(("Facteur par strate", o, "explicable"))
+
+    p_lgb = dict(PARAMS_MODELE, **(params or {}), **({"learning_rate": 0.15} if rapide else {}))
+    mapping = _mapping(d_lgb, feats)
+    for avec, nom in ((False, "Modèle LightGBM sans facteur"), (True, "Modèle LightGBM avec facteur")):
+        try:
+            _lgb()
+        except ImportError as e:
+            print(f"-- {nom} : ignoré ({e}) --")
+            continue
+        print(f"-- {nom} --")
+        t0 = time.time()
+        o = np.full(n, np.nan)
+        for tr, va in plis:
+            dtr, dva = d_lgb.iloc[tr], d_lgb.iloc[va]
+            Ftr = _facteurs_oof(dtr, strate, n_plein, complement) if avec else np.ones(len(dtr))
+            tab, comp = _table(dtr, strate, n_plein, complement)
+            Fva = _appliquer(tab, comp, strate, dva)[1] if avec else np.ones(len(dva))
+            b, best = _fit_lgb(dtr, Ftr, feats, mapping, p_lgb, dva, Fva)
+            o[va] = _pred_lgb(b, best, dva, Fva, feats, mapping)
+        oof[nom] = o
+        lignes.append((nom, o, "boîte noire"))
+        print(f"   {time.time() - t0:.0f} s")
+
+    comp_glm = None
+    if avec_glm:
+        print("\n-- Variantes de GLM --")
+        comp_glm = comparer_glm(df, resultats=None, mode=mode, strate=None, n_plein=n_plein, complement=complement,
+                                n_splits=n_splits, rapide=rapide, avec_lightgbm=avec_lightgbm_seul, interactions=interactions,
+                                alphas=alphas, params=params, seulement_glm=False, afficher=True)
+        d_glm = _preparer_glm(df, mode, comp_glm["interactions"])
+        for _, r in comp_glm["table"].iterrows():
+            if r["Méthode"] in comp_glm["deviances"] and r["Méthode"] not in ("Table de mortalité seule",):
+                o = np.full(len(d_glm), np.nan)
+                lignes.append((r["Méthode"], None, "explicable" if r["Type"] == "GLM" else "boîte noire"))  # déviance déjà connue
+
+    cov = np.zeros(n, dtype=bool)                                   # lignes couvertes par la validation (mode "futur" : pas toutes)
+    for tr, va in plis:
+        cov[va] = True
+    ref = pdev(y[cov], E[cov])
+    table = pd.DataFrame({"Méthode": ["Table de mortalité seule"], "Déviance hors-pli": [ref],
+                          "Gain vs table": [0.0], "Type": ["repère"]})
+    for nom, o, typ in lignes:
+        dv = pdev(y[cov], o[cov]) if o is not None else comp_glm["deviances"][nom]
+        table.loc[len(table)] = [nom, dv, 1 - dv / ref, typ]
+    table = table.sort_values("Déviance hors-pli").reset_index(drop=True)
+    table["Rang"] = table["Déviance hors-pli"].rank(method="min").astype(int)
+    candidats = table[table["Type"] != "repère"]
+    if seulement_explicable:
+        candidats = candidats[candidats["Type"] == "explicable"]
+    meilleur = candidats.loc[candidats["Déviance hors-pli"].idxmin(), "Méthode"]
+    table["Retenu"] = table["Méthode"] == meilleur
+
+    print("\n== TABLEAU FINAL : déviance de Poisson hors-pli du montant, toutes méthodes (plus petit = mieux) ==")
+    print(table[["Rang", "Méthode", "Déviance hors-pli", "Gain vs table", "Type", "Retenu"]].to_string(
+        index=False, formatters={"Déviance hors-pli": lambda x: _n(x), "Gain vs table": lambda x: f"{x:.1%}",
+                                 "Retenu": lambda x: "<== meilleure" if x else ""}))
+    if seulement_explicable and meilleur != table.iloc[0]["Méthode"]:
+        print(f"\nNote : « {table.iloc[0]['Méthode']}» fait mieux ({_n(table.iloc[0]['Déviance hors-pli'])}) mais n'est pas explicable "
+              f"(formule/tables) -> retenue = « {meilleur} ». seulement_explicable=False pour garder la meilleure quelle qu'elle soit.")
+
+    return dict(table=table, meilleur=meilleur, mode=mode, strate=list(strate), feats=feats, comp_glm=comp_glm,
+               n_plein=n_plein, complement=complement, rapide=rapide, params=params)
+
+
+def entrainer_meilleur_de_tout(df, comparaison, save_path="meilleur_modele_final.pkl"):
+    """Entraîne sur tout df la méthode retenue par comparer_tout() et l'enregistre. Renvoie un bundle
+    à passer à predire_meilleur() (fonctionne pour les 3 familles : facteur par strate, LightGBM, GLM)."""
+    nom, mode = comparaison["meilleur"], comparaison["mode"]
+    print(f"== Entraînement final de la méthode retenue : {nom} ==")
+    if nom == "Facteur par strate":
+        strate, n_plein, comp = comparaison["strate"], comparaison["n_plein"], comparaison["complement"]
+        d = _preparer_df(df, strate)
+        tab, c = _table(d, strate, n_plein, comp)
+        bundle = dict(famille="strate", nom=nom, strate=strate, tab=tab, comp=c)
+    elif nom.startswith("Modèle LightGBM"):
+        avec = "avec facteur" in nom
+        bundle = entrainer_modele(df, comparaison["strate"], colonnes=comparaison["feats"], avec_facteur=avec,
+                                  mode=mode, n_plein=comparaison["n_plein"], complement=comparaison["complement"],
+                                  rapide=comparaison["rapide"], params=comparaison["params"], save_path=None)
+        bundle["famille"] = "lightgbm"
+    else:
+        bundle = entrainer_meilleur(df, dict(comparaison["comp_glm"], meilleur=nom), save_path=None)
+        bundle["famille"] = "glm"
+    if save_path:
+        with open(save_path, "wb") as f:
+            pickle.dump(bundle, f)
+        print(f"   modèle enregistré : {save_path}")
+    return bundle
+
+
+def predire_meilleur(bundle, resultats, out_csv="soumission_finale.csv", sep=",", decimal="."):
+    """Prédit avec le modèle retenu par comparer_tout()/entrainer_meilleur_de_tout(), quelle que soit sa famille."""
+    if bundle["famille"] == "strate":
+        return _predire_strate_bundle(bundle, resultats, out_csv, sep, decimal)
+    if bundle["famille"] == "lightgbm":
+        return predire_avec_modele(bundle, resultats, out_csv, sep, decimal)
+    return predire_glm(bundle, resultats, out_csv, sep, decimal)
+
+
+def _predire_strate_bundle(bundle, resultats, out_csv, sep, decimal):
+    strate = bundle["strate"]
+    res = preparer_strates(resultats).reset_index(drop=True)
+    manque = [c for c in list(strate) + ["ExpecAmt"] if c not in res.columns]
+    assert not manque, f"Colonnes manquantes dans resultats : {manque}"
+    res["ExpecAmt"] = pd.to_numeric(res["ExpecAmt"], errors="coerce")
+    ok = _lignes_ok(res, ["ExpecAmt"] + list(strate))
+    assert ok.all(), f"{int((~ok).sum())} lignes de resultats ont une valeur manquante/infinie. Impossible de les predire."
+    amt, f, inconnu = _appliquer(bundle["tab"], bundle["comp"], strate, res)
+    sub = resultats.copy()
+    sub["DthAmt"] = amt
+    sub.to_csv(out_csv, index=False, sep=sep, decimal=decimal)
+    print(f"{_n(len(sub))} lignes prédites -> {out_csv}")
+    if inconnu.any():
+        print(f"ATTENTION : {_n(inconnu.sum())} lignes ont une strate absente de df -> facteur de repli utilisé.")
+    return sub
+
+
+def executer_tout(df, resultats, strate, save_path="meilleur_modele_final.pkl", out_csv="soumission_finale.csv", **kw):
+    """Tout en un : comparer_tout() + entrainer_meilleur_de_tout() + predire_meilleur(). Renvoie (bundle, sub, table)."""
+    comp = comparer_tout(df, resultats, strate, **kw)
+    print()
+    bundle = entrainer_meilleur_de_tout(df, comp, save_path)
+    print()
+    sub = predire_meilleur(bundle, resultats, out_csv)
+    return bundle, sub, comp["table"]
+
+
+# ============================================================================================
+# SECTION 6 — Mode d'emploi (exécute les cellules une par une)
+# ============================================================================================
+# import facteur_strates as fs            # (ou colle tout le fichier dans une cellule et retire "fs.")
+#
+# fs.verifier_3006()                                        # 1) vérifie 3 006, la règle de crédibilité et l'exemple
+#
+# STRATE = ["Sex", "Smoke", "Size"]                         # 2) TON choix de colonnes : change-le librement
+# tab = fs.table_strates(df, STRATE)                        #    voir les strates, décès, Z, facteur (secondes)
+#                                                           #    + vérifications des critères (messages seulement)
+# fs.verifier_criteres(df, STRATE)                          #    ou seulement les vérifications
+#
+# fs.evaluer(df, STRATE, resultats=resultats)               # 3) déviance de Poisson hors-pli (mode détecté seul)
+# fs.comparer_complements(df, STRATE, resultats=resultats)  #    effet du complément : "aucun" / "global" / "un"
+# fs.comparer_strates(df, {                                 #    ou plusieurs strates d'un coup
+#     "Global": [],
+#     "Sexe x Fumeur": ["Sex", "Smoke"],
+#     "Sexe x Fumeur x Strate": ["Sex", "Smoke", "Size"],
+#     "+ Durée": ["Sex", "Smoke", "Size", "DurBand"],
+# }, resultats=resultats)
+#
+# sub, tab = fs.predire_montant(df, resultats, STRATE)      # 4) prédiction du montant par facteur + CSV
+#
+# # 5) MODÈLE ENTRAÎNÉ (LightGBM) : à lancer APRÈS avoir regardé les strates (cellule 2)
+# fs.comparer_modeles(df, STRATE, resultats=resultats, rapide=True)     #    avec / sans facteur, test rapide
+# bundle = fs.entrainer_modele(df, STRATE, resultats=resultats)         #    validation + entraînement + modele_montant.pkl
+# sub = fs.predire_avec_modele(bundle, resultats)                       #    prédiction avec le modèle + CSV
+# bundle = fs.charger_modele("modele_montant.pkl")                      #    plus tard, sans réentraîner
+#
+# # 6) VARIANTES DE GLM : comparer, garder le meilleur, prédire sur resultats
+# comp = fs.comparer_glm(df, resultats=resultats, strate=STRATE, rapide=True)      #    tableau (test rapide)
+# bundle, sub, table = fs.executer_glm(df, resultats, strate=STRATE)                #    compare + meilleur + prédiction + CSV
+# bundle, sub, table = fs.executer_glm(df, resultats, seulement_glm=True)           #    meilleur GLM pur (formule explicite)
+# sub = fs.predire_glm(fs.charger_modele("meilleur_modele.pkl"), resultats)         #    plus tard, sans réentraîner
+#
+# # 7) TABLEAU FINAL : toutes les méthodes ensemble, meilleure gardée, prédiction sur resultats
+# comp = fs.comparer_tout(df, resultats, STRATE, rapide=True)                        #    test rapide, tableau complet
+# bundle, sub, table = fs.executer_tout(df, resultats, STRATE)                       #    compare + entraîne + prédit + CSV
+# bundle, sub, table = fs.executer_tout(df, resultats, STRATE, seulement_explicable=True)  # sans boîte noire
+# sub = fs.predire_meilleur(fs.charger_modele("meilleur_modele_final.pkl"), resultats)     # plus tard, sans réentraîner
