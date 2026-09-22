@@ -989,9 +989,9 @@ def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plei
     y, E = d_lgb["DthAmt"].to_numpy(float), d_lgb["ExpecAmt"].to_numpy(float)
     n = len(d_lgb)
     lignes, oof = [], {}
-
+ 
     print(f"Mode de validation : {mode} ({n_splits} plis) | strate = {list(strate) or '(global)'} | {_pl(n, 'ligne')}\n")
-
+ 
     print("-- Facteur par strate --")
     o = np.full(n, np.nan)
     for tr, va in plis:
@@ -999,7 +999,7 @@ def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plei
         o[va] = _appliquer(tab, comp, strate, d_lgb.iloc[va])[0]
     oof["Facteur par strate"] = o
     lignes.append(("Facteur par strate", o, "explicable"))
-
+ 
     p_lgb = dict(PARAMS_MODELE, **(params or {}), **({"learning_rate": 0.15} if rapide else {}))
     mapping = _mapping(d_lgb, feats)
     for avec, nom in ((False, "Modèle LightGBM sans facteur"), (True, "Modèle LightGBM avec facteur")):
@@ -1021,7 +1021,7 @@ def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plei
         oof[nom] = o
         lignes.append((nom, o, "boîte noire"))
         print(f"   {time.time() - t0:.0f} s")
-
+ 
     comp_glm = None
     if avec_glm:
         print("\n-- Variantes de GLM --")
@@ -1033,7 +1033,7 @@ def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plei
             if r["Méthode"] in comp_glm["deviances"] and r["Méthode"] not in ("Table de mortalité seule",):
                 o = np.full(len(d_glm), np.nan)
                 lignes.append((r["Méthode"], None, "explicable" if r["Type"] == "GLM" else "boîte noire"))  # déviance déjà connue
-
+ 
     cov = np.zeros(n, dtype=bool)                                   # lignes couvertes par la validation (mode "futur" : pas toutes)
     for tr, va in plis:
         cov[va] = True
@@ -1043,14 +1043,18 @@ def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plei
     for nom, o, typ in lignes:
         dv = pdev(y[cov], o[cov]) if o is not None else comp_glm["deviances"][nom]
         table.loc[len(table)] = [nom, dv, 1 - dv / ref, typ]
+    non_finies = table.loc[~np.isfinite(table["Déviance hors-pli"]), "Méthode"].tolist()
+    if non_finies:
+        print(f"\nATTENTION : déviance non calculable (NaN/inf) pour : {non_finies} -> écartées du classement.")
     table = table.sort_values("Déviance hors-pli").reset_index(drop=True)
-    table["Rang"] = table["Déviance hors-pli"].rank(method="min").astype(int)
-    candidats = table[table["Type"] != "repère"]
+    table["Rang"] = table["Déviance hors-pli"].rank(method="min")                 # NaN reste NaN, pas d'erreur
+    candidats = table[(table["Type"] != "repère") & np.isfinite(table["Déviance hors-pli"])]
     if seulement_explicable:
         candidats = candidats[candidats["Type"] == "explicable"]
+    assert len(candidats), "aucune méthode n'a une déviance calculable (toutes NaN/inf) : vérifie ExpecAmt et DthAmt"
     meilleur = candidats.loc[candidats["Déviance hors-pli"].idxmin(), "Méthode"]
     table["Retenu"] = table["Méthode"] == meilleur
-
+ 
     print("\n== TABLEAU FINAL : déviance de Poisson hors-pli du montant, toutes méthodes (plus petit = mieux) ==")
     print(table[["Rang", "Méthode", "Déviance hors-pli", "Gain vs table", "Type", "Retenu"]].to_string(
         index=False, formatters={"Déviance hors-pli": lambda x: _n(x), "Gain vs table": lambda x: f"{x:.1%}",
@@ -1058,7 +1062,7 @@ def comparer_tout(df, resultats, strate, colonnes_modele=None, mode=None, n_plei
     if seulement_explicable and meilleur != table.iloc[0]["Méthode"]:
         print(f"\nNote : « {table.iloc[0]['Méthode']}» fait mieux ({_n(table.iloc[0]['Déviance hors-pli'])}) mais n'est pas explicable "
               f"(formule/tables) -> retenue = « {meilleur} ». seulement_explicable=False pour garder la meilleure quelle qu'elle soit.")
-
+ 
     return dict(table=table, meilleur=meilleur, mode=mode, strate=list(strate), feats=feats, comp_glm=comp_glm,
                n_plein=n_plein, complement=complement, rapide=rapide, params=params)
 
