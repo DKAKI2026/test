@@ -1,0 +1,466 @@
+# -*- coding: utf-8 -*-
+"""
+GLM + LightGBM (stacking) — prédit UNIQUEMENT le montant (DthAmt).
+
+MÉTHODE
+  1) Point de départ EXPLICABLE : un GLM de Poisson (offset = log(ExpecAmt)) sur un ensemble de colonnes
+     choisi DYNAMIQUEMENT (sélection avant, par déviance de Poisson hors-pli — aucune liste figée à la main).
+  2) Correction : un LightGBM (perte de Poisson) apprend ce qu'il reste à corriger par-dessus le GLM,
+     sur le MÊME ensemble de colonnes retenu à l'étape 1.
+  3) Prédiction finale = ExpecAmt x ratio_GLM x correction_LightGBM.
+
+Le choix des colonnes est dynamique : `selectionner_colonnes()` part d'aucune colonne (le GLM ne voit que
+ExpecAmt) et ajoute, une par une, celle qui améliore le plus la déviance de Poisson hors-pli ; il s'arrête
+quand plus aucune colonne n'apporte un gain suffisant (SEUIL_GAIN). Change les données ou le seuil, et la
+liste retenue change avec — rien n'est codé en dur.
+
+FICHIER UNIQUE — contenu
+  1. Imports et constantes            5. Sélection DYNAMIQUE des colonnes (forward selection)
+  2. Métrique (déviance de Poisson)   6. GLM (point de départ) et LightGBM (correction)
+  3. Préparation des variables        7. Sauvegarde / chargement / prédiction
+  4. Variables de cohorte             8. Pipeline complet  run()   9. EXÉCUTION  executer()
+
+Utilisation :
+    sub = executer(df, resultats, rapide=True)   # test rapide (sélection + entraînement allégés)
+    sub = executer(df, resultats)                # complet
+"""
+import pickle
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import KFold
+
+
+# ============================================================================================
+# SECTION 1 — Imports et constantes
+# ============================================================================================
+TARGETS = ["DthAmt"]
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+# Clé de cohorte : mêmes assurés suivis d'une année à l'autre
+KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
+# 10 = T10+T20 et 11 = UL (3,4,5) n'existent que pour 2009-2011 -> groupes "grossiers" cohérents
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+# Colonnes CANDIDATES seulement — aucune n'est retenue d'office : voir SECTION 5.
+CANDIDATS = ["Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size", "IssueAge", "PolYear",
+            "AttdAge", "IssueYear", "YearStart", "log_qx_amt", "log_avg_size", "cv2", "log_expos",
+            "coh_ae_amt", "coh_log_E"]
+CANDIDATS_TEMPOREL = [c for c in CANDIDATS if c not in ("YearStart", "IssueYear")]  # extrapolation impossible
+
+SEUIL_GAIN = 0.0015       # gain relatif minimal de déviance pour garder une colonne (0.15 %) ; plus haut = liste plus courte
+PARAMS_GLM = dict(alpha=1e-4, max_iter=500)
+PARAMS_LGB = dict(learning_rate=0.05, num_leaves=31, min_data_in_leaf=50, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=1, lambda_l2=10.0, verbose=-1)
+
+
+# ============================================================================================
+# SECTION 2 — Métrique : déviance de Poisson (la métrique du défi pour le montant)
+# ============================================================================================
+def pdev(y, p):
+    """Déviance de Poisson moyenne. Plus petit = mieux."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+def _n(x, nd=0):
+    return f"{x:,.{nd}f}".replace(",", " ")
+
+
+# ============================================================================================
+# SECTION 3 — Préparation des variables
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009, 2223 -> 2022
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    d["IssueYear"] = d["YearStart"] - d["PolYear"]      # étiquette de cohorte d'émission
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)  # qx implicite de la table (montant)
+    d["log_qx_amt"] = np.log(d["qx_amt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2               # dispersion des montants (>= 1)
+    d["log_expos"] = np.log(e)
+    d["eff_n"] = a ** 2 / d["ExposAmt2"].clip(lower=1e-9)  # nb effectif de polices
+    return d
+
+
+def detect_mode(df, res):
+    return "interleaved" if res["Year"].isin(df["Year"]).mean() > 0.9 else "temporal"
+
+
+def make_folds(df, mode, n_splits, seed=42):
+    if mode == "interleaved":
+        return list(KFold(n_splits, shuffle=True, random_state=seed).split(df))
+    ys = np.sort(df["YearStart"].unique())[-3:]                   # validation sur les 3 dernières années
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+# ============================================================================================
+# SECTION 4 — Variables de cohorte (montant seulement)
+# ============================================================================================
+def cohort_table(src, k=1.0):
+    g = (src.groupby(KEY, sort=False).agg(DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum")).reset_index())
+    k_amt = k * src["ExpecAmt"].sum() / max(len(src), 1)
+    return g, k_amt
+
+
+def cohort_from_table(g, k_amt, dst, k=1.0):
+    m = dst[KEY].merge(g, on=KEY, how="left").fillna(0.0)
+    return pd.DataFrame({
+        "coh_ae_amt": ((m["DA"] + k_amt) / (m["EA"] + k_amt)).values,
+        "coh_log_E": np.log1p(m["EA"]).values}, index=dst.index)
+
+
+def cohort_apply(src, dst, k=1.0):
+    g, k_amt = cohort_table(src, k)
+    return cohort_from_table(g, k_amt, dst, k)
+
+
+def cohort_oof(src, n_splits=5, seed=0):
+    """Features de cohorte hors-pli (aucune fuite de la cible propre)."""
+    out = pd.DataFrame(index=src.index, columns=["coh_ae_amt", "coh_log_E"], dtype=float)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        out.iloc[va] = cohort_apply(src.iloc[tr], src.iloc[va]).values
+    return out
+
+
+# ============================================================================================
+# SECTION 5 — Sélection DYNAMIQUE des colonnes (forward selection, déviance hors-pli)
+#   Part d'aucune colonne (GLM = ExpecAmt seul), ajoute à chaque étape celle qui réduit le plus la
+#   déviance hors-pli, s'arrête quand le meilleur gain restant est sous SEUIL_GAIN. Rapide : le GLM
+#   sert d'éclaireur (le LightGBM final réutilisera l'ensemble retenu).
+# ============================================================================================
+def _glm_oof(d, cols, plis):
+    """Ratio prédit (DthAmt/ExpecAmt) hors-pli d'un GLM de Poisson sur `cols`."""
+    from sklearn.linear_model import PoissonRegressor
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    from sklearn.pipeline import Pipeline
+    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt")]
+    cat = [c for c in cols if c not in num]
+    if not cols:
+        return np.ones(len(d))
+    blocs = []
+    if cat:
+        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
+    o = np.ones(len(d))
+    E = d["ExpecAmt"].to_numpy(float)
+    y = d["DthAmt"].to_numpy(float)
+    for tr, va in plis:
+        pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)),
+                         ("glm", PoissonRegressor(**PARAMS_GLM))])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pipe.fit(d.iloc[tr][cols], y[tr] / np.clip(E[tr], 1e-9, None), glm__sample_weight=E[tr])
+        o[va] = np.clip(pipe.predict(d.iloc[va][cols]), 1e-3, 1e2)
+    return o
+
+
+def selectionner_colonnes(df, mode=None, candidats=None, n_splits=3, seuil_gain=SEUIL_GAIN, verbose=True):
+    """
+    Sélection avant (forward selection) : ajoute une colonne à la fois, celle qui réduit le plus la
+    déviance de Poisson hors-pli, jusqu'à ce que le meilleur gain restant passe sous seuil_gain.
+    Renvoie (colonnes retenues, historique des étapes en DataFrame).
+    """
+    d = prep(df)
+    if mode is None:
+        mode = "interleaved"           # par défaut ; passe mode="temporal" si resultats couvre des années futures
+    if mode == "interleaved":
+        d = pd.concat([d, cohort_oof(d)], axis=1)
+    else:
+        d[["coh_ae_amt", "coh_log_E"]] = 1.0, 0.0     # neutres : pas de cohorte en extrapolation temporelle
+
+    candidats = list(candidats or (CANDIDATS if mode == "interleaved" else CANDIDATS_TEMPOREL))
+    candidats = [c for c in candidats if c in d.columns]
+    plis = make_folds(d, mode, n_splits)
+    y, E = d["DthAmt"].to_numpy(float), d["ExpecAmt"].to_numpy(float)
+    base_dev = pdev(y, E)
+
+    retenues, restantes, historique = [], list(candidats), []
+    dev_actuelle = base_dev
+    if verbose:
+        print(f"Sélection dynamique (mode {mode}, {n_splits} plis) | déviance de départ (ExpecAmt seul) = {_n(base_dev)}")
+    while restantes:
+        gains = {}
+        for c in restantes:
+            o = _glm_oof(d, retenues + [c], plis)
+            gains[c] = pdev(y, E * o)
+        meilleure = min(gains, key=gains.get)
+        gain_relatif = 1 - gains[meilleure] / dev_actuelle
+        historique.append({"Étape": len(historique) + 1, "Colonne testée": meilleure,
+                           "Déviance": gains[meilleure], "Gain relatif": gain_relatif,
+                           "Retenue": gain_relatif >= seuil_gain})
+        if gain_relatif < seuil_gain:
+            if verbose:
+                print(f"  arrêt : meilleur gain restant ({meilleure} : {gain_relatif:.2%}) < seuil ({seuil_gain:.2%})")
+            break
+        retenues.append(meilleure)
+        restantes.remove(meilleure)
+        dev_actuelle = gains[meilleure]
+        if verbose:
+            print(f"  + {meilleure:<14s} déviance = {_n(dev_actuelle):>14s}  (gain {gain_relatif:.2%}, total {_n(1 - dev_actuelle / base_dev, 4)[:6]})")
+    if verbose:
+        print(f"Colonnes retenues ({len(retenues)}) : {retenues}")
+    return retenues, pd.DataFrame(historique)
+
+
+# ============================================================================================
+# SECTION 6 — GLM (point de départ) et LightGBM (correction)
+# ============================================================================================
+def fit_glm(d, cols):
+    """GLM final, ajusté sur toutes les lignes de `d`, sur les colonnes retenues."""
+    from sklearn.linear_model import PoissonRegressor
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    from sklearn.pipeline import Pipeline
+    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt")]
+    cat = [c for c in cols if c not in num]
+    blocs = []
+    if cat:
+        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
+    pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)), ("glm", PoissonRegressor(**PARAMS_GLM))])
+    E, y = d["ExpecAmt"].to_numpy(float), d["DthAmt"].to_numpy(float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pipe.fit(d[cols], y / np.clip(E, 1e-9, None), glm__sample_weight=E)
+    return pipe
+
+
+def glm_predict(pipe, d, cols):
+    return np.clip(pipe.predict(d[cols]), 1e-3, 1e2) if cols else np.ones(len(d))
+
+
+def _mapping(d, cols):
+    m = {}
+    for c in cols:
+        if not pd.api.types.is_numeric_dtype(d[c]):
+            m[c] = {v: i for i, v in enumerate(sorted(d[c].astype(str).unique()))}
+    return m
+
+
+def _X(d, cols, mapping):
+    X = d[cols].copy()
+    for c, mp in mapping.items():
+        X[c] = d[c].astype(str).map(mp).fillna(-1)
+    return X.astype(float)
+
+
+def fit_lgb(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
+    p = dict(params, objective="poisson", seed=seed)
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    return lgb.train(p, dtr, max_rounds, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)])
+
+
+def rep(name, y, p):
+    print(f"  {name:<38s} devPoisson={pdev(y, p):>16,.0f}  somme_pred/somme_reel={p.sum() / y.sum():.4f}".replace(",", " "))
+
+
+# ============================================================================================
+# SECTION 7 — Contrôle des données, sauvegarde, chargement, prédiction sur resultats
+# ============================================================================================
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + TARGETS), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques".replace(",", " "))
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), (
+            f"{int(bad_r.sum())} lignes de resultats ont une valeur manquante/infinie dans {CRITIQUES} "
+            f"(exemple d'index : {list(resultats.index[bad_r][:5])}). Impossible de predire ces lignes.")
+    bad = _lignes_invalides(df, CRITIQUES + TARGETS)
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement.".replace(",", " "))
+        df = df.loc[~bad]
+    return df
+
+
+def save_bundle(bundle, path):
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def predict(bundle, resultats):
+    """Prédit DthAmt pour `resultats` : ExpecAmt x ratio_GLM x correction_LightGBM."""
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+    if bundle["mode"] == "interleaved":
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res)], axis=1)
+    else:
+        res[["coh_ae_amt", "coh_log_E"]] = 1.0, 0.0
+    cols = bundle["colonnes"]
+    ratio = glm_predict(bundle["glm"], res, cols)
+    off = np.log(res["ExpecAmt"].clip(lower=1e-9).to_numpy(float) * ratio)
+    X = _X(res, cols, bundle["mapping"]) if cols else pd.DataFrame(index=res.index)
+    corr = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True))
+                    for m in bundle["models_lgb"]], axis=0)
+    amt = np.exp(off) * corr * bundle["f_a"]
+    sub = resultats.copy()
+    sub["DthAmt"] = np.clip(amt, 0, None)
+    return sub
+
+
+# ============================================================================================
+# SECTION 8 — Pipeline complet : run(df)
+# ============================================================================================
+def run(df, resultats=None, mode="auto", n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+        n_splits_selection=3, seuil_gain=SEUIL_GAIN, colonnes=None, params=None, verbose=True, save_path=None):
+    """
+    1) sélectionne dynamiquement les colonnes (à moins que `colonnes` soit fourni explicitement)
+    2) entraîne le GLM (point de départ) puis le LightGBM (correction) sur df SEULEMENT
+    3) sauvegarde le modèle et prédit sur resultats
+    """
+    params = dict(PARAMS_LGB, **(params or {}))
+    miss = [c for c in REQUIRED + TARGETS if c not in df.columns]
+    if resultats is not None:
+        miss += [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = verifier_donnees(df, None, verbose=False)
+    if mode == "auto":
+        assert resultats is not None, 'Sans `resultats`, précise mode="interleaved" ou mode="temporal".'
+        mode = detect_mode(df, resultats)
+    if verbose:
+        print(f"Mode : {mode} | lignes df={len(df):,}\n".replace(",", " "))
+
+    d = prep(df).reset_index(drop=True)
+    if mode == "interleaved":
+        d = pd.concat([d, cohort_oof(d)], axis=1)
+    else:
+        d[["coh_ae_amt", "coh_log_E"]] = 1.0, 0.0
+
+    if colonnes is None:
+        cols, historique = selectionner_colonnes(df, mode, None, n_splits_selection, seuil_gain, verbose)
+    else:
+        cols, historique = list(colonnes), None
+        if verbose:
+            print(f"Colonnes fournies explicitement (pas de sélection dynamique) : {cols}")
+
+    plis = make_folds(d, mode, n_splits)
+    n = len(d)
+    oof = np.full(n, np.nan)
+    mapping = _mapping(d, cols)
+    models = []
+    if verbose:
+        print(f"\nEntraînement GLM + LightGBM ({n_splits} plis)...")
+    for k, (tr, va) in enumerate(plis):
+        d_tr, d_va = d.iloc[tr], d.iloc[va]
+        glm = fit_glm(d_tr, cols)
+        r_tr, r_va = glm_predict(glm, d_tr, cols), glm_predict(glm, d_va, cols)
+        Etr, Eva = d_tr["ExpecAmt"].to_numpy(float), d_va["ExpecAmt"].to_numpy(float)
+        ytr, yva = d_tr["DthAmt"].to_numpy(float), d_va["DthAmt"].to_numpy(float)
+        Xtr, Xva = _X(d_tr, cols, mapping), _X(d_va, cols, mapping)
+        ztr = ytr / np.clip(Etr * r_tr, 1e-9, None)
+        zva = yva / np.clip(Eva * r_va, 1e-9, None)
+        otr, ova = np.zeros(len(tr)), np.zeros(len(va))          # offset déjà dans le poids via ExpecAmt*ratio
+        wtr, wva = Etr * r_tr, Eva * r_va
+        p_va = np.zeros(len(va))
+        for s in seeds:
+            b = fit_lgb(Xtr, ztr, otr, wtr, Xva, zva, ova, wva, s, max_rounds, params)
+            p_va += Eva * r_va * np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration)) / len(seeds)
+            models.append(b.model_to_string(num_iteration=b.best_iteration))
+        oof[va] = p_va
+        if verbose:
+            print(f"  pli {k + 1}/{n_splits} : {b.best_iteration} arbres")
+
+    cov = ~np.isnan(oof)
+    y = d["DthAmt"].to_numpy(float)[cov]
+    if verbose:
+        print("\n== Montant (DthAmt) - validation hors-pli ==")
+        rep("Table de mortalité seule (ExpecAmt)", y, d["ExpecAmt"].to_numpy(float)[cov])
+        rep("GLM + LightGBM (colonnes dynamiques)", y, oof[cov])
+
+    f_a = float(y.sum() / oof[cov].sum())
+    if verbose:
+        print(f"\nFacteur de calibration globale : DthAmt x{f_a:.4f}")
+
+    glm_final = fit_glm(d, cols)
+    r_all = glm_predict(glm_final, d, cols)
+    X_all = _X(d, cols, mapping)
+    z_all = d["DthAmt"].to_numpy(float) / np.clip(d["ExpecAmt"].to_numpy(float) * r_all, 1e-9, None)
+    w_all = d["ExpecAmt"].to_numpy(float) * r_all
+    n_rounds = max(50, int(1.1 * np.mean([lgb.Booster(model_str=m).num_trees() for m in models]))) if models else 100
+    b_final = lgb.train(dict(params, objective="poisson", seed=0), lgb.Dataset(X_all, z_all, weight=w_all), n_rounds)
+
+    bundle = dict(mode=mode, colonnes=cols, mapping=mapping, glm=glm_final, models_lgb=[b_final.model_to_string()],
+                 f_a=f_a, historique_selection=historique)
+    if mode == "interleaved":
+        bundle["coh_g"], bundle["coh_k_amt"] = cohort_table(d)
+    if save_path:
+        save_bundle(bundle, save_path)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path}")
+
+    sub = predict(bundle, resultats) if resultats is not None else None
+    return dict(sub=sub, bundle=bundle, mode=mode, colonnes=cols, oof=oof, f_a=f_a, historique_selection=historique)
+
+
+# ============================================================================================
+# SECTION 9 — EXÉCUTION
+# ============================================================================================
+def executer(df, resultats, save_path="modele_glm_lgb_montant.pkl", out_csv="soumission_montant.csv", rapide=False):
+    """
+    1) contrôle les données et choisit le mode (lignes mélangées ou années futures)
+    2) sélectionne dynamiquement les colonnes pertinentes pour DthAmt (forward selection, déviance hors-pli)
+    3) entraîne GLM (point de départ) + LightGBM (correction) sur df SEULEMENT, sauvegarde le modèle
+    4) prédit sur resultats, vérifie le résultat et écrit le CSV de soumission
+    rapide=True : sélection et entraînement allégés (test rapide).
+    Si ta variable s'appelle `résultats` (avec accent), appelle : executer(df, résultats)
+    """
+    df = verifier_donnees(df, resultats)
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    mode = "interleaved" if part > 0.9 else "temporal"
+    print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
+
+    kw = dict(n_splits=3, n_splits_selection=2, seeds=(0,), max_rounds=500, seuil_gain=0.003) if rapide else {}
+    out = run(df, mode=mode, save_path=save_path, **kw)
+
+    sub = predict(out["bundle"], resultats)
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[TARGETS].notna().all().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)".replace(",", " "))
+    print(sub[TARGETS].describe().loc[["count", "mean", "min", "max"]].round(4).to_string())
+    return sub
+
+
+# Exemple d'exécution (décommente la ligne voulue) :
+# sub = executer(df, resultats, rapide=True)   # test rapide
+# sub = executer(df, resultats)                # entraînement complet
