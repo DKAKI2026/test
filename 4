@@ -1,0 +1,399 @@
+# -*- coding: utf-8 -*-
+"""
+DÉFI MORTALITÉ (données ICA agrégées) : prédire DthAmt (montant des décès) UNIQUEMENT.
+VERSION LightGBM + SÉLECTION DYNAMIQUE DES FEATURES.
+
+FICHIER UNIQUE — contenu
+  1. Imports et constantes         6. Sauvegarde / chargement / prédiction
+  2. Métrique                      7. Pipeline d'entraînement  run()
+  3. Préparation des variables     8. EXÉCUTION                executer()
+  4. Variables de cohorte
+  5. Sélection dynamique des colonnes (importance CV)
+
+Idée clé sur la sélection de colonnes
+  - On part d'un pool de candidats (CANDIDATES_BASE + variables de cohorte), sans présupposer
+    lesquelles sont "pertinentes".
+  - On entraîne un modèle GBM Poisson (montant/exposition, offset = log(qx_amt)) en validation
+    croisée sur TOUS les candidats, et on mesure l'importance moyenne (gain LightGBM) de
+    chaque colonne à travers les plis et les graines.
+  - On normalise ces importances (somme = 1) et on ne garde que les colonnes dont l'importance
+    dépasse `selection_threshold` (1% par défaut). Si trop peu de colonnes passent le seuil, on
+    garde au minimum `selection_min_feats` colonnes (les plus importantes), pour éviter un
+    modèle dégénéré.
+  - Le modèle final n'est réentraîné qu'avec les colonnes retenues.
+  - Mettre `feature_selection=False` pour désactiver et utiliser tous les candidats.
+
+Idées clés (reste du pipeline, inchangé)
+  - On prédit l'écart réel/attendu (A/E) par rapport à la table ICA déjà fournie (ExpecAmt),
+    avec un GBM Poisson dont l'offset = log(qx_amt implicite).
+  - ExposAmt2 donne la variance réelle -> pondération eff_n = ExposAmt^2 / ExposAmt2.
+  - Cohortes : mêmes assurés d'une année à l'autre (Year+1, PolYear+1) -> A/E de cohorte comme
+    variable candidate (hors-pli, sans fuite).
+  - Calibration globale sur les prédictions hors-pli.
+
+Utilisation (dans un notebook ou un script où df et resultats existent) :
+    sub = executer(df, resultats)                  # sélection dynamique + entraînement complet
+    sub = executer(df, resultats, rapide=True)     # version rapide pour tester que tout tourne
+"""
+import pickle
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import KFold
+
+
+# ============================================================================================
+# SECTION 1 — Imports et constantes
+# ============================================================================================
+TARGET = "DthAmt"
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+# DthCnt n'est pas prédit, mais reste nécessaire dans df (historique) pour construire la
+# variable de cohorte "coh_ae_cnt", candidate comme les autres à la sélection dynamique.
+DF_EXTRA = ["DthCnt"]
+
+# Clé de cohorte : mêmes assurés suivis d'une année à l'autre
+KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
+# 10 = T10+T20 et 11 = UL (3,4,5) n'existent que pour 2009-2011 -> groupes "grossiers" cohérents
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+# Pool de candidats soumis à la sélection dynamique — on n'exclut rien a priori.
+CANDIDATES_BASE = ["YearStart", "Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size",
+                    "IssueAge", "PolYear", "AttdAge", "IssueYear", "log_qx", "log_qx_ratio",
+                    "log_avg_size", "cv2", "log_expos"]
+CANDIDATES_COH = ["coh_ae_cnt", "coh_ae_amt", "coh_log_E"]
+
+PARAMS = dict(learning_rate=0.03, num_leaves=63, min_data_in_leaf=50, feature_fraction=0.8,
+              bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0, verbose=-1)
+
+
+# ============================================================================================
+# SECTION 2 — Métrique (à remplacer par celle de la compétition)
+# ============================================================================================
+def METRIC(y, p):
+    """Plus petit = mieux."""
+    return float(np.sqrt(np.mean((np.asarray(y) - np.asarray(p)) ** 2)))
+
+
+# ============================================================================================
+# SECTION 3 — Préparation des variables
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009, 2223 -> 2022
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    d["IssueYear"] = d["YearStart"] - d["PolYear"]      # étiquette de cohorte d'émission
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_cnt"] = (d["ExpecCnt"] / e).clip(lower=1e-9)  # qx ICA implicite (nombre)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)  # qx ICA implicite (montant)
+    d["log_qx"] = np.log(d["qx_cnt"])
+    d["log_qx_ratio"] = np.log(d["qx_amt"] / d["qx_cnt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2               # dispersion des montants (>= 1)
+    d["log_expos"] = np.log(e)
+    d["eff_n"] = a ** 2 / d["ExposAmt2"].clip(lower=1e-9)  # nb effectif de polices
+    return d
+
+
+# ============================================================================================
+# SECTION 4 — Variables de cohorte (A/E des autres lignes de la même cohorte)
+# ============================================================================================
+def cohort_table(src, k=1.0):
+    """Table d'agrégats par cohorte (sauvegardable) calculée sur `src` (avec cibles)."""
+    g = (src.groupby(KEY, sort=False)
+            .agg(D=("DthCnt", "sum"), E=("ExpecCnt", "sum"),
+                 DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum"))
+            .reset_index())
+    k_amt = k * src["ExpecAmt"].sum() / max(src["ExpecCnt"].sum(), 1e-9)
+    return g, k_amt
+
+
+def cohort_from_table(g, k_amt, dst, k=1.0):
+    """A/E de cohorte appliqué à `dst`. Crédibilité : (D+k)/(E+k)."""
+    m = dst[KEY].merge(g, on=KEY, how="left").fillna(0.0)
+    return pd.DataFrame({
+        "coh_ae_cnt": ((m["D"] + k) / (m["E"] + k)).values,
+        "coh_ae_amt": ((m["DA"] + k_amt) / (m["EA"] + k_amt)).values,
+        "coh_log_E": np.log1p(m["E"]).values}, index=dst.index)
+
+
+def cohort_apply(src, dst, k=1.0):
+    g, k_amt = cohort_table(src, k)
+    return cohort_from_table(g, k_amt, dst, k)
+
+
+def cohort_oof(src, n_splits=5, seed=0):
+    """Features de cohorte hors-pli pour les lignes d'entraînement (aucune fuite de la cible propre)."""
+    out = pd.DataFrame(index=src.index, columns=CANDIDATES_COH, dtype=float)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        out.iloc[va] = cohort_apply(src.iloc[tr], src.iloc[va]).values
+    return out
+
+
+# ============================================================================================
+# SECTION 5 — Sélection dynamique des colonnes (importance CV)
+# ============================================================================================
+def build_candidates(use_coh):
+    cands = CANDIDATES_BASE + (CANDIDATES_COH if use_coh else [])
+    if not use_coh:   # extrapolation temporelle : les arbres ne savent pas extrapoler ces variables
+        cands = [c for c in cands if c not in ("YearStart", "IssueYear")]
+    return cands
+
+
+def amt_targets(d, w0):
+    y = (d["DthAmt"] / d["ExposAmt"].clip(lower=1e-9)).values     # taux de montant
+    return y, np.log(d["qx_amt"]).values, (d["eff_n"] / w0).values
+
+
+def fit(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
+    p = dict(params, objective="poisson", seed=seed)
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    return lgb.train(p, dtr, max_rounds, valid_sets=[dva],
+                     callbacks=[lgb.early_stopping(100, verbose=False)])
+
+
+def raw(m, X):
+    return m.predict(X, raw_score=True, num_iteration=m.best_iteration)
+
+
+def make_folds(df, mode, n_splits, seed=42):
+    if mode == "interleaved":
+        return list(KFold(n_splits, shuffle=True, random_state=seed).split(df))
+    ys = np.sort(df["YearStart"].unique())[-3:]                   # validation sur les 3 dernières années
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+def compute_importance(df, mode, candidates, w0, n_splits, seeds, max_rounds, params, seed_cv=42):
+    """CV sur TOUS les candidats -> importance moyenne (gain, normalisee a 1) de chaque colonne."""
+    use_coh = mode == "interleaved"
+    imp_sum = pd.Series(0.0, index=candidates)
+    n_models = 0
+    for k, (tr, va) in enumerate(make_folds(df, mode, n_splits, seed=seed_cv)):
+        d_tr0, d_va0 = df.iloc[tr], df.iloc[va]
+        if use_coh:
+            d_tr = pd.concat([d_tr0, cohort_oof(d_tr0, seed=k)], axis=1)
+            d_va = pd.concat([d_va0, cohort_apply(d_tr0, d_va0)], axis=1)
+        else:
+            d_tr, d_va = d_tr0, d_va0
+        ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0)
+        ya_va, oa_va, wa_va = amt_targets(d_va, w0)
+        for s in seeds:
+            m = fit(d_tr[candidates], ya_tr, oa_tr, wa_tr, d_va[candidates], ya_va, oa_va, wa_va,
+                     s, max_rounds, params)
+            imp_sum += pd.Series(m.feature_importance(importance_type="gain"), index=candidates)
+            n_models += 1
+    imp_mean = imp_sum / max(n_models, 1)
+    total = imp_mean.sum()
+    return (imp_mean / total if total > 0 else imp_mean).sort_values(ascending=False)
+
+
+def select_features(importance, threshold_factor=1.0, min_feats=5, max_feats=None, verbose=True):
+    """
+    Seuil RELATIF au nombre de candidats, pas une valeur fixe arbitraire :
+        seuil = threshold_factor x (1 / nb_candidats)
+    threshold_factor=1.0 (defaut) -> une colonne doit avoir au moins l'importance moyenne
+    ("above-average importance") pour etre retenue. >1.0 = plus strict, <1.0 = plus permissif.
+    """
+    n = len(importance)
+    baseline = 1.0 / n if n > 0 else 0.0
+    threshold = threshold_factor * baseline
+    selected = importance[importance >= threshold].index.tolist()
+    if len(selected) < min_feats:
+        selected = importance.head(min_feats).index.tolist()
+    if max_feats:
+        selected = selected[:max_feats]
+    if verbose:
+        print(f"\nImportance des candidats (gain normalise) — seuil = {threshold_factor:.1f} x moyenne "
+              f"= {threshold:.1%} (moyenne sur {n} candidats = {baseline:.1%}) :")
+        for f, v in importance.items():
+            marque = "garde " if f in selected else "ecarte"
+            print(f"  [{marque}] {f:<16s} {v:.4f}")
+        print(f"-> {len(selected)} colonnes retenues sur {len(importance)} candidates : {selected}")
+    return selected
+
+
+# ============================================================================================
+# SECTION 6 — Sauvegarde, chargement et prédiction sur resultats
+# ============================================================================================
+def save_bundle(bundle, path):
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def predict(bundle, resultats):
+    """Prédit DthAmt pour `resultats` avec les modèles sauvegardés (sans réentraîner)."""
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+    if bundle["mode"] == "interleaved":
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res, bundle["coh_k"])], axis=1)
+    X = res[bundle["feats"]]
+    off_a = np.log(res["qx_amt"]).values
+    pred = np.mean([res["ExposAmt"].values * np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off_a)
+                     for m in bundle["models"]], axis=0)
+    sub = resultats.copy()
+    sub[TARGET] = np.clip(pred * bundle["f_a"], 0, None)
+    return sub
+
+# ---- Contrôle des données (valeurs manquantes / infinies) -----------------------------------
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    """
+    Rapport sur les valeurs manquantes / infinies, puis nettoyage de df :
+      - df : les lignes inutilisables (colonne critique ou cible manquante) sont RETIRÉES de l'entraînement.
+      - resultats : on ne peut pas inventer une prédiction -> erreur claire si une colonne critique est invalide.
+    Renvoie df nettoyé.
+    """
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + DF_EXTRA + [TARGET]), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques")
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), (
+            f"{int(bad_r.sum())} lignes de resultats ont une valeur manquante/infinie dans {CRITIQUES} "
+            f"(exemple d'index : {list(resultats.index[bad_r][:5])}). Impossible de predire ces lignes : corrige-les ou retire-les.")
+    bad = _lignes_invalides(df, CRITIQUES + DF_EXTRA + [TARGET])
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement (valeur manquante/infinie).")
+        df = df.loc[~bad]
+    return df
+# ============================================================================================
+# SECTION 7 — Pipeline d'entraînement : run(df)
+# ============================================================================================
+def run(df, resultats=None, mode="auto", n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+        params=None, verbose=True, save_path=None,
+        feature_selection=True, selection_threshold_factor=1.0, selection_min_feats=5,
+        selection_seeds=(0,), selection_max_rounds=800):
+    params = dict(PARAMS, **(params or {}))
+    miss = [c for c in REQUIRED + DF_EXTRA + [TARGET] if c not in df.columns]
+    if resultats is not None:
+        miss += [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = prep(df).reset_index(drop=True)
+    if mode == "auto":
+        assert resultats is not None, 'Sans `resultats`, précise mode="interleaved" ou mode="temporal".'
+        from_res = prep(resultats)
+        mode = "interleaved" if from_res["Year"].isin(df["Year"]).mean() > 0.9 else "temporal"
+    use_coh = mode == "interleaved"
+    candidates = build_candidates(use_coh)
+    w0 = df["eff_n"].mean()
+    if verbose:
+        print(f"Mode : {mode} | lignes df={len(df):,} | {len(candidates)} candidats : {candidates}")
+
+    # --- 1) selection dynamique des colonnes pertinentes ------------------------------------
+    if feature_selection:
+        imp = compute_importance(df, mode, candidates, w0, n_splits, selection_seeds,
+                                   selection_max_rounds, params)
+        feats = select_features(imp, selection_threshold_factor, selection_min_feats, verbose=verbose)
+    else:
+        feats = candidates
+        if verbose:
+            print("Selection dynamique desactivee -> tous les candidats sont utilises.")
+
+    # --- 2) entrainement final sur les colonnes retenues -------------------------------------
+    n = len(df)
+    oof = np.full(n, np.nan)
+    models = []
+    for k, (tr, va) in enumerate(make_folds(df, mode, n_splits)):
+        d_tr0, d_va0 = df.iloc[tr], df.iloc[va]
+        if use_coh:
+            d_tr = pd.concat([d_tr0, cohort_oof(d_tr0, seed=k)], axis=1)
+            d_va = pd.concat([d_va0, cohort_apply(d_tr0, d_va0)], axis=1)
+        else:
+            d_tr, d_va = d_tr0, d_va0
+        ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0)
+        ya_va, oa_va, wa_va = amt_targets(d_va, w0)
+        p_va = np.zeros(len(va))
+        for s in seeds:
+            m = fit(d_tr[feats], ya_tr, oa_tr, wa_tr, d_va[feats], ya_va, oa_va, wa_va, s, max_rounds, params)
+            p_va += d_va["ExposAmt"].values * np.exp(raw(m, d_va[feats]) + oa_va) / len(seeds)
+            models.append(m.model_to_string(num_iteration=m.best_iteration))
+        oof[va] = p_va
+        if verbose:
+            print(f"  pli {k + 1}: iter={m.best_iteration}")
+
+    cov = ~np.isnan(oof)
+    y = df[TARGET].values[cov]
+    if verbose:
+        print(f"\n== {TARGET} - validation hors-pli ==")
+        print(f"  Baseline ICA (ExpecAmt)  metrique={METRIC(y, df['ExpecAmt'].values[cov]):,.4f}")
+        print(f"  Modele GBM (colonnes retenues) metrique={METRIC(y, oof[cov]):,.4f}")
+
+    # --- calibration globale (ratio réel / prédit sur les prédictions hors-pli)
+    f_a = y.sum() / oof[cov].sum()
+    if verbose:
+        print(f"\nFacteur de calibration : {TARGET} x{f_a:.4f}")
+
+    bundle = dict(mode=mode, feats=feats, models=models, f_a=float(f_a), coh_k=1.0)
+    if use_coh:
+        bundle["coh_g"], bundle["coh_k_amt"] = cohort_table(df, bundle["coh_k"])
+    if save_path:
+        save_bundle(bundle, save_path)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path} ({len(models)} modeles, {len(feats)} colonnes)")
+
+    sub = predict(bundle, resultats) if resultats is not None else None
+    return dict(sub=sub, bundle=bundle, mode=mode, feats=feats, oof=oof, calib=f_a)
+
+
+# ============================================================================================
+# SECTION 8 — EXÉCUTION
+# ============================================================================================
+def executer(df, resultats, save_path="modele_dthamt.pkl", out_csv="soumission_dthamt.csv", rapide=False):
+    """
+    1) choisit le mode (lignes mélangées ou années futures)
+    2) selectionne dynamiquement les colonnes pertinentes pour DthAmt (importance CV)
+    3) entraîne sur df SEULEMENT et sauvegarde le modèle
+    4) prédit sur resultats, vérifie le résultat et écrit le CSV de soumission
+    rapide=True : petit entraînement (1 graine, 3 plis, learning rate élevé) pour tester le code.
+    Si ta variable s'appelle `résultats` (avec accent), appelle : executer(df, résultats)
+    """
+    df = verifier_donnees(df, resultats)
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    mode = "interleaved" if part > 0.9 else "temporal"
+    print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
+
+    kw = dict(params=dict(learning_rate=0.1), seeds=(0,), n_splits=3, max_rounds=500,
+              selection_max_rounds=200) if rapide else {}
+    out = run(df, mode=mode, save_path=save_path, **kw)
+
+    sub = predict(out["bundle"], resultats)
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[TARGET].notna().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)")
+    print(sub[[TARGET]].describe().loc[["count", "mean", "min", "max"]].round(4).to_string())
+    return sub
+
+
+# Exemple d'exécution (décommente la ligne voulue) :
+# sub = executer(df, resultats, rapide=True)   # test rapide
+# sub = executer(df, resultats)                # entraînement complet
