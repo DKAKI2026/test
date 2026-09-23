@@ -1,0 +1,1307 @@
+# -*- coding: utf-8 -*-
+"""
+BACKEND — aucune dépendance à Streamlit. Toute la logique de calcul vit ici ; app.py ne fait que l'appeler
+et afficher ce qu'il renvoie. Prédit uniquement le montant (DthAmt).
+
+Sections : 1. Constantes  2. Préparation des données  3. Facteur par strate + crédibilité (messages structurés)
+           4. Sélection dynamique des colonnes  5. Algorithmes (LightGBM, GLM+LightGBM, GLM Poisson,
+           GLM Tweedie, GAM, EBM)  6. Entraînement par plis (repris pli par pli, interruptible)
+           7. Sauvegarde / chargement / prédiction
+"""
+import io
+import math
+import pickle
+import time
+import warnings
+from statistics import NormalDist
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import KFold
+
+warnings.filterwarnings("ignore")
+
+# ============================================================================================
+# SECTION 1 — Constantes
+# ============================================================================================
+TARGET = "DthAmt"
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+N_PLEIN = 3006
+
+LIBELLES = {
+    "Sex": {1: "Homme", 2: "Femme"},
+    "Smoke": {1: "Fumeur", 2: "Non-fumeur", 3: "Inconnu"},
+    "PolGrp": {1: "Vie entière", 2: "T100", 3: "Vie universelle", 6: "Temporaire 10/20 ans",
+               8: "Autre temporaire", 9: "Autre"},
+    "Size": {1: "0-10k", 2: "10-50k", 3: "50-100k", 4: "100-250k", 5: "250-500k",
+             6: "500k-1m", 7: "1-2m", 8: "2m+"},
+    "Par": {0: "Sans participation", 1: "Avec participation"},
+    "Base": {0: "Avenant", 1: "Contrat de base"},
+}
+
+# Colonnes "brutes" toujours candidates, et colonnes calculées suggérées (voir SECTION 2)
+COLONNES_BRUTES = ["Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge", "PolYear"]
+COLONNES_CALCULEES = {
+    "PolGrp":      "Types de police regroupés (fusionne les catégories qui n'existent que sur certaines années)",
+    "AttdAge":     "Âge atteint = âge à l'émission + année de police − 1",
+    "IssueYear":   "Année d'émission (identifie la cohorte) — inutile si les années à prédire sont absentes de df",
+    "YearStart":   "Année de début (2009, 2010…) — inutile si les années à prédire sont absentes de df",
+    "log_qx_amt":  "Log du taux de mortalité implicite de la table (ExpecAmt / ExposAmt)",
+    "log_avg_size":"Log du capital moyen par police (ExposAmt / ExposCnt)",
+    "cv2":         "Dispersion des capitaux dans la cellule (1 = tous identiques)",
+    "log_expos":   "Log du nombre de polices exposées",
+    "coh_ae_amt":  "Réel/attendu des AUTRES lignes de la même cohorte (mêmes assurés, autres années)",
+    "coh_log_E":   "Poids (log) de l'information disponible derrière coh_ae_amt",
+}
+SUGGESTION_PAR_DEFAUT = ["PolGrp", "AttdAge", "log_qx_amt", "log_avg_size", "cv2", "coh_ae_amt", "coh_log_E"]
+
+ALGOS = ["LightGBM", "GLM + LightGBM", "GLM de Poisson", "GLM Tweedie", "GAM", "EBM"]
+
+
+# ============================================================================================
+# SECTION 2 — Préparation des données
+# ============================================================================================
+def lire_csv(fichier_bytes_ou_chemin, sep=None, decimal="."):
+    """Lit un CSV depuis des bytes (upload) ou un chemin. Devine le séparateur si sep=None."""
+    if isinstance(fichier_bytes_ou_chemin, (bytes, bytearray)):
+        buf = io.BytesIO(fichier_bytes_ou_chemin)
+    else:
+        buf = fichier_bytes_ou_chemin
+    return pd.read_csv(buf, sep=sep, decimal=decimal, engine="python" if sep is None else "c")
+
+
+def diagnostic_colonnes(df):
+    """Colonnes requises manquantes, et colonnes cibles déjà présentes ou non."""
+    manque = [c for c in REQUIRED if c not in df.columns]
+    return dict(manque=manque, a_target=TARGET in df.columns, colonnes=list(df.columns))
+
+
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def nettoyer(df, resultats=None):
+    """Nettoyage avant entraînement : retire de df les lignes invalides, bloque si resultats en a.
+    Renvoie (df_propre, rapport: list[str], erreur_resultats: str | None)."""
+    rapport = []
+    for nom, d, cols in (("df", df, REQUIRED + [TARGET]), ("resultats", resultats, REQUIRED)):
+        if d is None:
+            continue
+        for c in cols:
+            if c not in d.columns:
+                continue
+            x = pd.to_numeric(d[c], errors="coerce")
+            bad = int((~np.isfinite(x.to_numpy(float))).sum())
+            if bad:
+                rapport.append(f"{nom} · {c} : {bad:,} valeurs manquantes/infinies".replace(",", " "))
+    erreur_res = None
+    if resultats is not None:
+        cols_ok = [c for c in CRITIQUES if c in resultats.columns]
+        bad_r = _lignes_invalides(resultats, cols_ok)
+        if bad_r.any():
+            erreur_res = (f"{int(bad_r.sum())} lignes de resultats ont une valeur manquante/infinie dans "
+                         f"{cols_ok} : impossible de les prédire tant qu'elles ne sont pas corrigées.")
+    bad = _lignes_invalides(df, [c for c in CRITIQUES + [TARGET] if c in df.columns])
+    n_retirees = int(bad.sum())
+    if n_retirees:
+        rapport.append(f"ATTENTION : {n_retirees:,} lignes de df retirées de l'entraînement.".replace(",", " "))
+        df = df.loc[~bad].copy()
+    return df, rapport, erreur_res
+
+
+def prep(d):
+    """Ajoute toutes les colonnes calculées (section COLONNES_CALCULEES)."""
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    d["IssueYear"] = d["YearStart"] - d["PolYear"]
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)
+    d["log_qx_amt"] = np.log(d["qx_amt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2
+    d["log_expos"] = np.log(e)
+    d["eff_n"] = a ** 2 / d["ExposAmt2"].clip(lower=1e-9)
+    return d
+
+
+def detecter_mode(df, resultats):
+    return "melange" if resultats["Year"].isin(df["Year"]).mean() > 0.9 else "futur"
+
+
+def cohort_table(src, k=1.0):
+    """Table d'agrégats par cohorte (mêmes assurés suivis d'une année à l'autre), montant seulement."""
+    g = src.groupby(KEY, sort=False).agg(DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum")).reset_index()
+    k_amt = k * src["ExpecAmt"].sum() / max(len(src), 1)
+    return g, k_amt
+
+
+def cohort_from_table(g, k_amt, dst, k=1.0):
+    m = dst[KEY].merge(g, on=KEY, how="left").fillna(0.0)
+    return pd.DataFrame({"coh_ae_amt": ((m["DA"] + k_amt) / (m["EA"] + k_amt)).values,
+                         "coh_log_E": np.log1p(m["EA"]).values}, index=dst.index)
+
+
+def cohort_apply(src, dst, k=1.0):
+    g, k_amt = cohort_table(src, k)
+    return cohort_from_table(g, k_amt, dst, k)
+
+
+def cohort_oof(src, n_splits=5, seed=0):
+    """Features de cohorte hors-pli pour les lignes d'entraînement (aucune fuite de la cible propre)."""
+    out = pd.DataFrame(index=src.index, columns=["coh_ae_amt", "coh_log_E"], dtype=float)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        out.iloc[va] = cohort_apply(src.iloc[tr], src.iloc[va]).values
+    return out
+
+
+def preparer(df, mode):
+    """prep() + colonnes de cohorte correctement rattachées (hors-pli en mode 'melange', neutres sinon).
+    À utiliser partout où les colonnes calculées (coh_ae_amt, coh_log_E incluses) doivent vraiment exister."""
+    d = prep(df)
+    if mode == "melange":
+        d = pd.concat([d, cohort_oof(d)], axis=1)
+    else:
+        d["coh_ae_amt"], d["coh_log_E"] = 1.0, 0.0
+    return d
+
+
+def plis(d, mode, n_splits, seed=42):
+    if mode == "melange":
+        return list(KFold(n_splits, shuffle=True, random_state=seed).split(d))
+    ys = np.sort(d["YearStart"].unique())[-min(3, n_splits):]
+    yr = d["YearStart"].to_numpy()
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+def pdev(y, p):
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+# ============================================================================================
+# SECTION 3 — Facteur par strate + les 5 critères de crédibilité (messages structurés pour l'UI)
+# ============================================================================================
+def credibilite(deces, n_plein=N_PLEIN):
+    return np.minimum(1.0, np.sqrt(np.asarray(deces, float) / n_plein))
+
+
+def table_strates(d, strate, n_plein=N_PLEIN):
+    """d doit déjà être préparé (prep()). Renvoie un DataFrame : une ligne par strate."""
+    cols = list(strate) or ["_tout"]
+    d2 = d.assign(_tout=0) if not strate else d
+    g = (d2.groupby(cols).agg(Lignes=("DthAmt", "size"), Deces=("DthCnt", "sum") if "DthCnt" in d.columns else ("DthAmt", "size"),
+                              Attendu=("ExpecAmt", "sum"), Reel=("DthAmt", "sum")).reset_index())
+    if "DthCnt" not in d.columns:                      # montant seul disponible : la crédibilité utilise l'exposition
+        g["Deces"] = 0.0
+    g["Ratio"] = np.where(g["Attendu"] > 0, g["Reel"] / g["Attendu"].where(g["Attendu"] > 0, 1.0), 1.0)
+    g["Z"] = credibilite(g["Deces"], n_plein)
+    g["Facteur"] = g["Z"] * g["Ratio"]
+    g["Poids"] = g["Attendu"] / g["Attendu"].sum()
+    for c in cols:
+        if c in LIBELLES:
+            g[c + "_libelle"] = g[c].map(LIBELLES[c]).fillna(g[c].astype(str))
+    return g.sort_values("Deces", ascending=False).reset_index(drop=True)
+
+
+def appliquer_facteur(tab, strate, d):
+    cols = list(strate) or ["_tout"]
+    d2 = d.assign(_tout=0) if not strate else d
+    m = d2[cols].merge(tab[cols + ["Facteur"]], on=cols, how="left")
+    inconnu = m["Facteur"].isna().to_numpy()
+    f = m["Facteur"].fillna(0.0).to_numpy(float)          # strate inconnue -> Z=0 -> facteur 0 (aucun a priori)
+    return d["ExpecAmt"].to_numpy(float) * f, f, inconnu
+
+
+def criteres_credibilite(d, strate, tab, n_plein=N_PLEIN):
+    """Les 5 critères, chacun sous forme {titre, lignes: [(symbole, texte)]}. Rien ne lève d'exception :
+    une vérification impossible renvoie un ⚠ au lieu de planter."""
+    blocs = []
+
+    def bloc(titre, fn):
+        lignes = []
+        try:
+            fn(lignes)
+        except Exception as e:
+            lignes.append(("⚠", f"vérification impossible ({type(e).__name__}: {e})"))
+        blocs.append({"titre": titre, "lignes": lignes})
+
+    def racine(lignes):
+        z = np.minimum(1.0, np.sqrt(tab["Deces"] / n_plein))
+        ecart = float(np.abs(z - tab["Z"]).max())
+        lignes.append(("✓" if ecart < 1e-9 else "⚠", f"Z = racine(décès / {n_plein:,}) recalculé pour "
+                       f"{len(tab)} strates : écart max = {ecart:.1e}".replace(",", " ")))
+        pleines = tab["Z"] >= 1.0
+        lignes.append(("ℹ", f"{int(pleines.sum())} strate(s) à 100 % de crédibilité "
+                       f"({tab.loc[pleines, 'Poids'].sum():.0%} des prestations attendues)"))
+
+    def intervalle(lignes):
+        z90 = float(NormalDist().inv_cdf(0.95))
+        z_def = float(math.erf(0.03 * math.sqrt(n_plein) / math.sqrt(2)))
+        lignes.append(("✓" if abs(z_def - 0.90) < 0.02 else "⚠",
+                       f"À {n_plein:,} décès, Z(intervalle ±3 %) = {z_def:.0%} (cohérent avec 90 % de confiance)".replace(",", " ")))
+        if "ExposAmt2" not in d.columns or "ExposCnt" not in d.columns:
+            lignes.append(("ℹ", "colonnes ExposAmt2/ExposCnt absentes : ajustement à la dispersion des capitaux ignoré"))
+            return
+        cols = [c for c in strate] or ["_tout"]
+        d2 = d.assign(_tout=0) if not strate else d
+        a = d2.groupby(cols).agg(E=("ExposCnt", "sum"), A=("ExposAmt", "sum"), A2=("ExposAmt2", "sum")).reset_index()
+        m = tab[cols].merge(a, on=cols, how="left")
+        cv2 = np.where(m["A"] > 0, m["A2"] * m["E"] / m["A"] ** 2, 1.0)
+        cv2 = np.clip(cv2, 1.0, None)
+        seuil = n_plein * cv2
+        z_ajuste = np.minimum(1.0, np.sqrt(tab["Deces"].to_numpy(float) / seuil))
+        ecart = tab["Z"].to_numpy(float) - z_ajuste
+        moins = ecart > 0.10
+        w = tab["Poids"].to_numpy(float)
+        lignes.append(("⚠" if moins.any() else "✓",
+                       f"{int(moins.sum())} strate(s) ({w[moins].sum():.0%} des prestations) : Z (décès) dépasse de "
+                       f"plus de 10 pts le Z ajusté à la dispersion des capitaux"))
+
+    def whitney(lignes):
+        K = n_plein / 4
+        lignes.append(("✓", f"Avec K = {K:,.0f}, Z = 50 % à {K:,.0f} décès, comme la racine carrée".replace(",", " ")))
+        z_w = tab["Deces"] / (tab["Deces"] + K)
+        ecart = float(np.average(np.abs(tab["Z"] - z_w), weights=tab["Poids"]))
+        lignes.append(("ℹ", f"écart moyen pondéré |Z racine − Z Whitney| sur tes strates : {ecart:.1%}"))
+
+    def buhlmann(lignes):
+        cols = list(strate) or ["_tout"]
+        x = d.assign(_tout=0) if not strate else d
+        x = x[x["ExpecAmt"] > 0]
+        g = x.groupby(cols, sort=False).ngroup().to_numpy()
+        r, n = int(g.max()) + 1, len(x)
+        if r < 2 or n <= r:
+            lignes.append(("⚠", "non applicable : il faut au moins 2 strates et plusieurs lignes par strate"))
+            return
+        m = x["ExpecAmt"].to_numpy(float)
+        X = (x["DthAmt"] / x["ExpecAmt"]).to_numpy(float)
+        mj = np.bincount(g, weights=m)
+        Xj = np.bincount(g, weights=m * X) / mj
+        mtot = mj.sum()
+        Xbar = float((mj * Xj).sum() / mtot)
+        v = float(np.bincount(g, weights=m * (X - Xj[g]) ** 2).sum() / (n - r))
+        a = float(((mj * (Xj - Xbar) ** 2).sum() - (r - 1) * v) / (mtot - (mj ** 2).sum() / mtot))
+        if not (a > 0 and np.isfinite(a) and np.isfinite(v)):
+            lignes.append(("⚠", f"variance entre strates estimée ≤ 0 (a={a:.3g}) : non applicable ici"))
+            return
+        k = v / a
+        z_bs = mj / (mj + k)
+        lignes.append(("✓", f"k = v/a = {v:.3g} / {a:.3g} = {k:.3g} (en montant attendu)"))
+        lignes.append(("ℹ", f"Z Bühlmann-Straub : min {z_bs.min():.0%}, moyenne pondérée "
+                       f"{np.average(z_bs, weights=mj / mtot):.0%} (racine carrée : {np.average(tab['Z'], weights=tab['Poids']):.0%})"))
+
+    def bayes(lignes):
+        if "ExpecCnt" not in d.columns:
+            lignes.append(("ℹ", "colonne ExpecCnt absente : vérification ignorée"))
+            return
+        cols = [c for c in strate] or ["_tout"]
+        d2 = d.assign(_tout=0) if not strate else d
+        a = d2.groupby(cols).agg(E=("ExpecCnt", "sum")).reset_index()
+        m = tab[cols].merge(a, on=cols, how="left")
+        E = m["E"].to_numpy(float)
+        D = tab["Deces"].to_numpy(float)
+        ok = np.isfinite(E) & (E > 0)
+        E, D, w = E[ok], D[ok], tab["Poids"].to_numpy(float)[ok]
+        if len(E) < 2:
+            lignes.append(("⚠", "non applicable : il faut au moins 2 strates"))
+            return
+        mu = D.sum() / E.sum()
+        R = D / E
+        tau2 = ((E * (R - mu) ** 2).sum() - mu * (len(E) - 1)) / (E.sum() - (E ** 2).sum() / E.sum())
+        if not (tau2 > 0 and np.isfinite(tau2)):
+            lignes.append(("⚠", "variance entre strates ≤ 0 : approche bayésienne sans effet ici"))
+            return
+        beta = mu / tau2
+        Z = E / (E + beta)
+        lignes.append(("✓", f"loi a priori Gamma (moyenne = ratio global {mu:.4f})"))
+        lignes.append(("ℹ", f"Z bayésien : Z = 50 % à environ {beta * mu:,.0f} décès ; moyenne pondérée "
+                       f"{np.average(Z, weights=w):.0%}".replace(",", " ")))
+
+    bloc("Fluctuation limitée, racine carrée", racine)
+    bloc("Fluctuation limitée, intervalle de confiance", intervalle)
+    bloc("Formule de Whitney N/(N+K)", whitney)
+    bloc("Bühlmann / Bühlmann-Straub", buhlmann)
+    bloc("Bayésienne (Poisson-Gamma)", bayes)
+    return blocs
+
+
+# ============================================================================================
+# SECTION 4 — Sélection dynamique des colonnes (forward selection, GLM comme éclaireur rapide)
+# ============================================================================================
+def _glm_ratio_oof(d, cols, plis_):
+    from sklearn.linear_model import PoissonRegressor
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    from sklearn.pipeline import Pipeline
+    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt", "cv2")]
+    cat = [c for c in cols if c not in num]
+    o = np.ones(len(d))
+    if not cols:
+        return o
+    blocs = []
+    if cat:
+        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
+    E, y = d["ExpecAmt"].to_numpy(float), d["DthAmt"].to_numpy(float)
+    for tr, va in plis_:
+        pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)),
+                         ("glm", PoissonRegressor(alpha=1e-4, max_iter=400))])
+        pipe.fit(d.iloc[tr][cols], y[tr] / np.clip(E[tr], 1e-9, None), glm__sample_weight=E[tr])
+        o[va] = np.clip(pipe.predict(d.iloc[va][cols]), 1e-3, 1e2)
+    return o
+
+
+def selection_dynamique(d, candidats, mode, seuil_gain, n_splits=3, callback=None):
+    """Forward selection. callback(etape_dict) est appelé après chaque étape (pour affichage live)."""
+    plis_ = plis(d, mode, n_splits)
+    y, E = d["DthAmt"].to_numpy(float), d["ExpecAmt"].to_numpy(float)
+    base_dev = pdev(y, E)
+    retenues, restantes = [], [c for c in candidats if c in d.columns]
+    dev_actuelle = base_dev
+    historique = []
+    while restantes:
+        gains = {c: pdev(y, E * _glm_ratio_oof(d, retenues + [c], plis_)) for c in restantes}
+        meilleure = min(gains, key=gains.get)
+        gain_rel = 1 - gains[meilleure] / dev_actuelle
+        etape = dict(colonne=meilleure, deviance=gains[meilleure], gain=gain_rel, retenue=gain_rel >= seuil_gain,
+                    gain_total=1 - gains[meilleure] / base_dev)
+        historique.append(etape)
+        if callback:
+            callback(etape)
+        if gain_rel < seuil_gain:
+            break
+        retenues.append(meilleure)
+        restantes.remove(meilleure)
+        dev_actuelle = gains[meilleure]
+    return retenues, historique, base_dev
+
+
+# ============================================================================================
+# SECTION 5 — Algorithmes : chacun expose  fit(d_tr, d_va, cols, params, facteur_tr, facteur_va) -> (p_va, model)
+#   facteur_* : point de départ optionnel (Z x ratio de la strate), ou None si pas de facteur.
+# ============================================================================================
+def _mapping(d, cols):
+    m = {}
+    for c in cols:
+        if c in d.columns and not pd.api.types.is_numeric_dtype(d[c]):
+            m[c] = {v: i for i, v in enumerate(sorted(d[c].astype(str).unique()))}
+    return m
+
+
+def _X_num(d, cols, mapping):
+    X = d[cols].copy() if cols else pd.DataFrame(index=d.index)
+    for c, mp in mapping.items():
+        X[c] = d[c].astype(str).map(mp).fillna(-1)
+    return X.astype(float)
+
+
+def _point_depart(d, F):
+    return d["ExpecAmt"].to_numpy(float) * (np.ones(len(d)) if F is None else np.maximum(F, 1e-3))
+
+
+class ModeleFit:
+    """Petit conteneur générique : garde ce qu'il faut pour repredire plus tard."""
+    def __init__(self, algo, payload, mapping=None, cols=None):
+        self.algo, self.payload, self.mapping, self.cols = algo, payload, mapping, cols
+
+    def predict(self, d, cols=None, F=None):
+        cols = cols if cols is not None else self.cols
+        base = _point_depart(d, F)
+        if self.algo == "LightGBM":
+            import lightgbm as lgb
+            X = _X_num(d, cols, self.mapping)
+            b = lgb.Booster(model_str=self.payload)
+            return base * np.exp(b.predict(X, raw_score=True))
+        if self.algo == "GLM + LightGBM":
+            import lightgbm as lgb
+            ratio = np.clip(self.payload["glm"].predict(d[cols]), 1e-3, 1e2) if cols else np.ones(len(d))
+            X = _X_num(d, cols, self.mapping)
+            corr = np.exp(lgb.Booster(model_str=self.payload["lgb"]).predict(X, raw_score=True))
+            return base * ratio * corr
+        if self.algo in ("GLM de Poisson", "GLM Tweedie"):
+            ratio = np.clip(self.payload.predict(d[cols]), 1e-3, 1e2) if cols else np.ones(len(d))
+            return base * ratio
+        if self.algo == "GAM":
+            Xn = _X_num(d, cols, self.mapping).to_numpy()
+            ratio = np.clip(self.payload.predict(Xn), 1e-3, 1e2)
+            return base * ratio
+        if self.algo == "EBM":
+            X = _X_num(d, cols, self.mapping)
+            ratio = np.clip(self.payload.predict(X), 1e-3, 1e2)
+            return base * ratio
+        raise ValueError(self.algo)
+
+
+def _glm_pipeline(cols):
+    from sklearn.linear_model import PoissonRegressor
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    from sklearn.pipeline import Pipeline
+    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt", "cv2")]
+    cat = [c for c in cols if c not in num]
+    blocs = []
+    if cat:
+        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
+    return Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)), ("glm", PoissonRegressor(alpha=1e-4, max_iter=400))])
+
+
+def fit_algo(algo, d_tr, d_va, cols, params, F_tr=None, F_va=None, seed=0):
+    y_tr, y_va = d_tr["DthAmt"].to_numpy(float), d_va["DthAmt"].to_numpy(float)
+    base_tr, base_va = _point_depart(d_tr, F_tr), _point_depart(d_va, F_va)
+
+    if algo in ("GLM de Poisson", "GLM Tweedie"):
+        from sklearn.linear_model import TweedieRegressor
+        z = y_tr / np.clip(base_tr, 1e-9, None)
+        if algo == "GLM de Poisson":
+            pipe = _glm_pipeline(cols)
+        else:
+            from sklearn.compose import ColumnTransformer
+            from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+            from sklearn.pipeline import Pipeline
+            num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                            "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt", "cv2")]
+            cat = [c for c in cols if c not in num]
+            blocs = ([("cat", OneHotEncoder(handle_unknown="ignore"), cat)] if cat else []) + \
+                    ([("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num)] if num else [])
+            pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)),
+                             ("glm", TweedieRegressor(power=1.5, link="log", alpha=1e-4, max_iter=400))])
+        if cols:
+            pipe.fit(d_tr[cols], z, glm__sample_weight=base_tr)
+            ratio_va = np.clip(pipe.predict(d_va[cols]), 1e-3, 1e2)
+        else:
+            ratio_va = np.ones(len(d_va))
+        return base_va * ratio_va, ModeleFit(algo, pipe, cols=cols)
+
+    if algo == "GAM":
+        from pygam import PoissonGAM, s, f
+        mapping = _mapping(d_tr, cols)
+        Xtr, Xva = _X_num(d_tr, cols, mapping), _X_num(d_va, cols, mapping)
+        if not cols:
+            return base_va, ModeleFit(algo, None, mapping, cols)
+        terms = None
+        for i, c in enumerate(cols):
+            t = f(i) if c in mapping or c in ("Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size") else s(i)
+            terms = t if terms is None else terms + t
+        z_tr = y_tr / np.clip(base_tr, 1e-9, None)                     # cible = ratio (comme le GLM)
+        w_tr = np.clip(base_tr, 1e-9, None)
+        w_tr = w_tr / w_tr.mean()                                      # poids normalisés : évite les débordements numériques
+        gam = PoissonGAM(terms, verbose=False)
+        try:
+            gam.fit(Xtr.to_numpy(), z_tr, weights=w_tr)
+        except Exception:                                              # divergence possible sur des données difficiles
+            gam = PoissonGAM(terms, lam=10, verbose=False)              # on retente avec une pénalité plus forte
+            gam.fit(Xtr.to_numpy(), z_tr, weights=w_tr)
+        ratio_va = np.clip(gam.predict(Xva.to_numpy()), 1e-3, 1e2)
+        return base_va * ratio_va, ModeleFit(algo, gam, mapping, cols)
+
+    if algo == "EBM":
+        from interpret.glassbox import ExplainableBoostingRegressor
+        mapping = _mapping(d_tr, cols)
+        Xtr, Xva = _X_num(d_tr, cols, mapping), _X_num(d_va, cols, mapping)
+        if not cols:
+            return base_va, ModeleFit(algo, None, mapping, cols)
+        w_tr = np.clip(base_tr, 1e-9, None)
+        w_tr = w_tr / w_tr.mean()
+        m = ExplainableBoostingRegressor(objective="poisson_deviance", random_state=seed,
+                                         max_rounds=params.get("max_rounds", 2000))
+        m.fit(Xtr, y_tr / np.clip(base_tr, 1e-9, None), sample_weight=w_tr)
+        ratio_va = np.clip(m.predict(Xva), 1e-3, 1e2)
+        return base_va * ratio_va, ModeleFit(algo, m, mapping, cols)
+
+    # LightGBM et GLM + LightGBM
+    import lightgbm as lgb
+    mapping = _mapping(d_tr, cols)
+    Xtr, Xva = _X_num(d_tr, cols, mapping), _X_num(d_va, cols, mapping)
+    if algo == "GLM + LightGBM" and cols:
+        glm = _glm_pipeline(cols)
+        z_glm = y_tr / np.clip(base_tr, 1e-9, None)
+        glm.fit(d_tr[cols], z_glm, glm__sample_weight=base_tr)
+        r_tr = np.clip(glm.predict(d_tr[cols]), 1e-3, 1e2)
+        r_va = np.clip(glm.predict(d_va[cols]), 1e-3, 1e2)
+        base_tr, base_va = base_tr * r_tr, base_va * r_va
+    else:
+        glm = None
+    ztr = y_tr / np.clip(base_tr, 1e-9, None)
+    zva = y_va / np.clip(base_va, 1e-9, None)
+    p = dict(objective="poisson", learning_rate=params.get("learning_rate", 0.05), num_leaves=31,
+            min_data_in_leaf=50, feature_fraction=0.9, lambda_l2=10.0, verbose=-1, seed=seed)
+    dtr = lgb.Dataset(Xtr, ztr, weight=base_tr)
+    dva = lgb.Dataset(Xva, zva, weight=base_va, reference=dtr)
+    b = lgb.train(p, dtr, params.get("max_rounds", 2000), valid_sets=[dva],
+                  callbacks=[lgb.early_stopping(100, verbose=False)])
+    p_va = base_va * np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration))
+    payload = dict(glm=glm, lgb=b.model_to_string(num_iteration=b.best_iteration)) if algo == "GLM + LightGBM" \
+        else b.model_to_string(num_iteration=b.best_iteration)
+    return p_va, ModeleFit(algo, payload, mapping, cols)
+
+
+def fit_final(algo, d, cols, params, F=None, seed=0):
+    """Ajuste sur TOUTES les lignes de d (après validation), pour le modèle final."""
+    _, modele = fit_algo(algo, d, d, cols, params, F, F, seed)
+    return modele
+
+
+# ============================================================================================
+# SECTION 6 — Entraînement pli par pli (repris/interrompu entre deux appels)
+# ============================================================================================
+def etat_initial(d, algo, cols, mode, n_splits, params, avec_facteur, strate, tab_facteur, seuil_facteur):
+    return dict(d=d, algo=algo, cols=cols, mode=mode, n_splits=n_splits, params=params,
+               avec_facteur=avec_facteur, strate=strate, tab_facteur=tab_facteur,
+               plis=plis(d, mode, n_splits), pli_courant=0, oof=np.full(len(d), np.nan),
+               modeles=[], temps_par_pli=[], termine=False, interrompu=False)
+
+
+def entrainer_un_pli(etat, seed=0):
+    """Entraîne UN pli, met à jour etat en place, renvoie un résumé de l'étape (pour affichage live)."""
+    k = etat["pli_courant"]
+    tr, va = etat["plis"][k]
+    d, cols = etat["d"], etat["cols"]
+    d_tr, d_va = d.iloc[tr], d.iloc[va]
+    F_tr = F_va = None
+    if etat["avec_facteur"]:
+        # crédibilité recalculée sur le pli d'entraînement seulement (hors-pli, sans fuite)
+        tab_tr = table_strates(d_tr, etat["strate"])
+        F_tr = appliquer_facteur(tab_tr, etat["strate"], d_tr)[1]
+        F_va = appliquer_facteur(tab_tr, etat["strate"], d_va)[1]
+    t0 = time.time()
+    p_va, modele = fit_algo(etat["algo"], d_tr, d_va, cols, etat["params"], F_tr, F_va, seed)
+    dt = time.time() - t0
+    etat["oof"][va] = p_va
+    etat["modeles"].append(modele)
+    etat["temps_par_pli"].append(dt)
+    etat["pli_courant"] += 1
+    if etat["pli_courant"] >= len(etat["plis"]):
+        etat["termine"] = True
+    y_va = d_va["DthAmt"].to_numpy(float)
+    return dict(pli=k + 1, sur=len(etat["plis"]), temps=dt, deviance_pli=pdev(y_va, p_va),
+               deviance_table_pli=pdev(y_va, d_va["ExpecAmt"].to_numpy(float)))
+
+
+def resume_hors_pli(etat):
+    cov = ~np.isnan(etat["oof"])
+    d = etat["d"]
+    y, e = d["DthAmt"].to_numpy(float)[cov], d["ExpecAmt"].to_numpy(float)[cov]
+    return dict(n=int(cov.sum()), deviance_table=pdev(y, e), deviance_modele=pdev(y, etat["oof"][cov]),
+               somme_pred_reel=float(etat["oof"][cov].sum() / y.sum()))
+
+
+def finaliser(etat, seed=0):
+    """Modèle final : réentraîne sur TOUTES les lignes de df avec les plis déjà faits (moyenne des poids
+    d'arbres) — ici simplifié : réajuste une dernière fois sur tout d."""
+    d = etat["d"]
+    F = None
+    if etat["avec_facteur"]:
+        tab_all = table_strates(d, etat["strate"])
+        F = appliquer_facteur(tab_all, etat["strate"], d)[1]
+        etat["tab_facteur_finale"] = tab_all
+    if etat["mode"] == "melange" and any(c in etat["cols"] for c in ("coh_ae_amt", "coh_log_E")):
+        etat["coh_g"], etat["coh_k_amt"] = cohort_table(d)     # table complète (pas hors-pli) pour prédire sur resultats
+    modele = fit_final(etat["algo"], d, etat["cols"], etat["params"], F, seed)
+    etat["modele_final"] = modele
+    return modele
+
+
+# ============================================================================================
+# SECTION 7 — Sauvegarde, chargement, prédiction sur resultats
+# ============================================================================================
+def construire_bundle(etat):
+    return dict(algo=etat["algo"], cols=etat["cols"], mode=etat["mode"], avec_facteur=etat["avec_facteur"],
+               strate=etat["strate"], tab_facteur=etat.get("tab_facteur_finale"), modele=etat["modele_final"],
+               coh_g=etat.get("coh_g"), coh_k_amt=etat.get("coh_k_amt"), resume=resume_hors_pli(etat))
+
+
+def bundle_to_bytes(bundle):
+    return pickle.dumps(bundle)
+
+
+def bundle_from_bytes(b):
+    return pickle.loads(b)
+
+
+def predire(bundle, resultats):
+    res = prep(resultats).reset_index(drop=True)
+    if bundle.get("coh_g") is not None:
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res)], axis=1)
+    elif any(c in bundle["cols"] for c in ("coh_ae_amt", "coh_log_E")):
+        res["coh_ae_amt"], res["coh_log_E"] = 1.0, 0.0      # mode 'futur' : pas de cohorte, valeurs neutres
+    F = None
+    if bundle["avec_facteur"]:
+        F = appliquer_facteur(bundle["tab_facteur"], bundle["strate"], res)[1]
+    amt = bundle["modele"].predict(res, bundle["cols"], F)
+    sub = resultats.copy()
+    sub["DthAmt"] = np.clip(amt, 0, None)
+    return sub
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+FRONTEND (Streamlit) — ne contient AUCUN calcul : tout est délégué à backend.py.
+Assistant pas-à-pas : données -> strates & crédibilité -> facteur -> algorithme -> colonnes -> entraînement -> résultats.
+
+Lancement : streamlit run app.py
+"""
+import hashlib
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import backend as b
+
+st.set_page_config(page_title="Assistant mortalité — montant des décès", page_icon="🧮", layout="wide")
+
+CSS_PATH = Path(__file__).parent / "style.css"
+if CSS_PATH.exists():
+    st.markdown(f"<style>{CSS_PATH.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+
+ETAPES = ["Données", "Strates & crédibilité", "Facteur", "Algorithme", "Colonnes calculées",
+          "Sélection des colonnes", "Entraînement", "Résultats"]
+
+# ------------------------------------------------------------------------------------------ état
+def init_etat():
+    defauts = dict(etape=0, df=None, df_nom=None, resultats=None, strate=[], sans_strate=False,
+                   tab_strate=None, avec_facteur=None, algo=b.ALGOS[0], n_splits=5, mode_override="auto",
+                   rapide=False, learning_rate=0.05, max_rounds=2000, cols_calc=list(b.SUGGESTION_PAR_DEFAUT),
+                   methode_cols="dynamique", seuil_gain=0.0015, colonnes_final=None, historique_selection=None,
+                   train=None, train_signature=None, bundle=None)
+    for k, v in defauts.items():
+        st.session_state.setdefault(k, v)
+
+
+init_etat()
+
+
+def aller(delta):
+    st.session_state.etape = max(0, min(len(ETAPES) - 1, st.session_state.etape + delta))
+
+
+def signature_actuelle():
+    s = (st.session_state.algo, tuple(st.session_state.colonnes_final or []), st.session_state.n_splits,
+        st.session_state.mode_override, st.session_state.avec_facteur, tuple(st.session_state.strate),
+        st.session_state.rapide, st.session_state.learning_rate, st.session_state.max_rounds)
+    return hashlib.md5(str(s).encode()).hexdigest()
+
+
+def badge(symbole, texte):
+    classe = {"✓": "badge-ok", "⚠": "badge-warn", "ℹ": "badge-info"}[symbole]
+    st.markdown(f"<div class='ligne-message'><span class='badge {classe}'>{symbole}</span> {texte}</div>",
+               unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------------------------------------ en-tête + barre d'étapes
+st.markdown("""
+<div class="entete-app">
+    <div class="puce">🧮</div>
+    <div>
+        <h1>Assistant de modélisation — montant des décès</h1>
+        <p>Table de mortalité corrigée par facteur ou par algorithme, choisi et validé pas à pas</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+chips = ""
+for i, nom in enumerate(ETAPES):
+    cls = "active" if i == st.session_state.etape else ("faite" if i < st.session_state.etape else "")
+    chips += f"<div class='etape-item {cls}'>{i + 1}. {nom}</div>"
+st.markdown(f"<div class='barre-etapes'>{chips}</div>", unsafe_allow_html=True)
+
+etape = st.session_state.etape
+
+
+# ============================================================================================
+# ÉTAPE 0 — Données : glisser-déposer le CSV, aperçu, nettoyage
+# ============================================================================================
+if etape == 0:
+    st.markdown("<div class='carte'><h3>📂 1–2 · Charger et voir les données (df)</h3>", unsafe_allow_html=True)
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        fichier = st.file_uploader("Glisse-dépose le CSV de df ici", type=["csv"])
+    with col2:
+        sep = st.selectbox("Séparateur", ["auto", ",", ";", "\t"], index=0)
+        decimal = st.selectbox("Décimale", [".", ","], index=0)
+
+    if fichier is not None:
+        try:
+            df = b.lire_csv(fichier.getvalue(), sep=None if sep == "auto" else sep, decimal=decimal)
+            st.session_state.df, st.session_state.df_nom = df, fichier.name
+        except Exception as e:
+            st.error(f"Impossible de lire ce fichier : {e}")
+            st.session_state.df = None
+
+    df = st.session_state.df
+    if df is not None:
+        diag = b.diagnostic_colonnes(df)
+        st.success(f"« {st.session_state.df_nom} » chargé : {len(df):,} lignes, {len(df.columns)} colonnes".replace(",", " "))
+        if diag["manque"]:
+            st.error(f"Colonnes obligatoires manquantes : {diag['manque']}")
+        else:
+            dfc, rapport, _ = b.nettoyer(df, None)
+            if dfc is not df:
+                st.session_state.df = dfc
+            if rapport:
+                for r in rapport:
+                    badge("⚠", r)
+            else:
+                badge("✓", "Aucune valeur manquante ou infinie détectée.")
+            st.markdown("**Aperçu**")
+            st.dataframe(st.session_state.df.head(50), height=260, use_container_width=True)
+            st.markdown("**Résumé statistique**")
+            st.dataframe(st.session_state.df.describe().T, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    peut_avancer = st.session_state.df is not None and not b.diagnostic_colonnes(st.session_state.df)["manque"]
+    c1, c2 = st.columns(2)
+    c2.button("Suivant →", type="primary", disabled=not peut_avancer, on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 1 — Strates & crédibilité
+# ============================================================================================
+elif etape == 1:
+    df = st.session_state.df
+    d = b.prep(df)
+    colonnes_possibles = [c for c in b.COLONNES_BRUTES + ["PolGrp", "AttdAge"] if c in d.columns]
+
+    st.markdown("<div class='carte'><h3>🧩 3 · Choisir les colonnes de la strate</h3>", unsafe_allow_html=True)
+    sans = st.checkbox("Continuer sans strate (ne pas travailler avec le facteur)", value=st.session_state.sans_strate)
+    st.session_state.sans_strate = sans
+    strate = st.multiselect("Colonnes de la strate", colonnes_possibles, default=st.session_state.strate,
+                            disabled=sans, help="Change librement cette liste : le tableau ci-dessous se recalcule.")
+    st.session_state.strate = strate
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if not sans and strate:
+        tab = b.table_strates(d, strate)
+        st.session_state.tab_strate = tab
+        z100 = tab["Z"] >= 1.0
+        st.markdown("<div class='carte'><h3>📊 4 · Crédibilité des strates</h3>", unsafe_allow_html=True)
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown(f"<div class='metrique-box'><div class='val'>{len(tab)}</div><div class='lab'>strates</div></div>", unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"<div class='metrique-box'><div class='val'>{int(z100.sum())}</div><div class='lab'>à 100 % de crédibilité</div></div>", unsafe_allow_html=True)
+        with m3:
+            st.markdown(f"<div class='metrique-box'><div class='val'>{tab.loc[z100, 'Poids'].sum():.0%}</div><div class='lab'>des prestations couvertes</div></div>", unsafe_allow_html=True)
+        st.write("")
+        cols_aff = [c for c in strate] + ["Lignes", "Deces", "Attendu", "Reel", "Ratio", "Z", "Facteur", "Poids"]
+        st.dataframe(tab[cols_aff].style.format({"Attendu": "{:,.0f}", "Reel": "{:,.0f}", "Ratio": "{:.3f}",
+                                                 "Z": "{:.0%}", "Facteur": "{:.3f}", "Poids": "{:.1%}",
+                                                 "Deces": "{:,.0f}"}), use_container_width=True, height=320)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='carte'><h3>🔎 5 · Autres critères de crédibilité (à titre informatif)</h3>", unsafe_allow_html=True)
+        blocs = b.criteres_credibilite(d, strate, tab)
+        onglets = st.tabs([bl["titre"] for bl in blocs])
+        for onglet, bl in zip(onglets, blocs):
+            with onglet:
+                for s, t in bl["lignes"]:
+                    badge(s, t)
+        st.markdown("</div>", unsafe_allow_html=True)
+    elif not sans:
+        st.info("Sélectionne au moins une colonne, ou coche « continuer sans strate ».")
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent", on_click=aller, args=(-1,), use_container_width=True)
+    peut = sans or bool(strate)
+    c2.button("Suivant →", type="primary", disabled=not peut, on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 2 — Facteur : l'utiliser comme point de départ ou non
+# ============================================================================================
+elif etape == 2:
+    st.markdown("<div class='carte'><h3>⚖️ 6–7 · Travailler avec le facteur ?</h3>", unsafe_allow_html=True)
+    if st.session_state.sans_strate or not st.session_state.strate:
+        st.info("Aucune strate choisie à l'étape précédente : le facteur n'est pas utilisé. "
+               "Reviens à l'étape « Strates & crédibilité » si tu changes d'avis.")
+        st.session_state.avec_facteur = False
+    else:
+        st.write(f"Strate retenue : `{st.session_state.strate}`. Le facteur peut servir de **point de départ** "
+                "à l'algorithme (celui-ci n'apprend plus que la correction qu'il reste à faire), ou être ignoré "
+                "(l'algorithme part directement de la table de mortalité).")
+        choix = st.radio("Choix", ["Utiliser le facteur comme point de départ", "Ne pas l'utiliser (repartir de la table seule)"],
+                         index=0 if st.session_state.avec_facteur is not False else 1)
+        st.session_state.avec_facteur = choix.startswith("Utiliser")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent (changer la strate)", on_click=aller, args=(-1,), use_container_width=True)
+    c2.button("Suivant →", type="primary", on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 3 — Algorithme + réglages de validation croisée
+# ============================================================================================
+elif etape == 3:
+    st.markdown("<div class='carte'><h3>🤖 8 · Choisir l'algorithme (avec validation croisée)</h3>", unsafe_allow_html=True)
+    descr = {
+        "LightGBM": "Arbres boostés — précis, mais boîte noire.",
+        "GLM + LightGBM": "GLM explicable comme point de départ, LightGBM apprend la correction — précis, semi-explicable.",
+        "GLM de Poisson": "Une formule multiplicative, des tables de facteurs — explicable.",
+        "GLM Tweedie": "Comme le GLM de Poisson, adapté aux montants très dispersés — explicable.",
+        "GAM": "Courbes lisses par variable (âge, durée…) — explicable, plus souple qu'un GLM.",
+        "EBM": "Un arbre par variable, courbes lisibles — souvent proche de LightGBM en précision, tout en restant explicable.",
+    }
+    algo = st.selectbox("Algorithme", b.ALGOS, index=b.ALGOS.index(st.session_state.algo))
+    st.session_state.algo = algo
+    st.caption(descr[algo])
+
+    d = b.prep(st.session_state.df)
+    mode_detecte = "melange (auto)"
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        mode_override = st.selectbox("Mode de validation", ["auto", "melange", "futur"],
+                                     index=["auto", "melange", "futur"].index(st.session_state.mode_override),
+                                     help="'auto' détecte le mode une fois resultats chargé, à l'étape Entraînement.")
+        st.session_state.mode_override = mode_override
+    with c2:
+        st.session_state.n_splits = st.number_input("Nombre de plis (validation croisée)", 2, 10, st.session_state.n_splits)
+    with c3:
+        st.session_state.rapide = st.checkbox("Mode rapide (réglages allégés, pour tester)", value=st.session_state.rapide)
+
+    if algo in ("LightGBM", "GLM + LightGBM"):
+        c4, c5 = st.columns(2)
+        st.session_state.learning_rate = c4.slider("Taux d'apprentissage (LightGBM)", 0.01, 0.3, st.session_state.learning_rate)
+        st.session_state.max_rounds = c5.slider("Nombre maximal d'arbres", 100, 5000, st.session_state.max_rounds, step=100)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent", on_click=aller, args=(-1,), use_container_width=True)
+    c2.button("Suivant →", type="primary", on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 4 — Colonnes calculées suggérées
+# ============================================================================================
+elif etape == 4:
+    st.markdown("<div class='carte'><h3>➕ 9 · Colonnes calculées suggérées</h3>", unsafe_allow_html=True)
+    st.write("Décoche celles que tu ne veux pas proposer à la sélection des colonnes (étape suivante).")
+    choix = []
+    for col, expl in b.COLONNES_CALCULEES.items():
+        coche = st.checkbox(f"**{col}** — {expl}", value=col in st.session_state.cols_calc, key=f"calc_{col}")
+        if coche:
+            choix.append(col)
+    st.session_state.cols_calc = choix
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent", on_click=aller, args=(-1,), use_container_width=True)
+    c2.button("Suivant →", type="primary", on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 5 — Sélection des colonnes à entraîner (manuelle ou dynamique)
+# ============================================================================================
+elif etape == 5:
+    mode_s5 = st.session_state.mode_override
+    if mode_s5 == "auto":
+        mode_s5 = "melange"
+    d = b.preparer(st.session_state.df, mode_s5)
+    candidats = [c for c in b.COLONNES_BRUTES if c in d.columns] + list(st.session_state.cols_calc)
+    if st.session_state.avec_facteur:
+        candidats = [c for c in candidats if c not in st.session_state.strate]  # évite la redondance avec le facteur
+
+    st.markdown("<div class='carte'><h3>🎯 10 · Colonnes à entraîner</h3>", unsafe_allow_html=True)
+    methode = st.radio("Méthode", ["Sélection manuelle", "Sélection dynamique selon un seuil"],
+                       index=0 if st.session_state.methode_cols == "manuelle" else 1)
+    st.session_state.methode_cols = "manuelle" if methode.startswith("Sélection manuelle") else "dynamique"
+
+    if st.session_state.methode_cols == "manuelle":
+        defaut = [c for c in (st.session_state.colonnes_final or candidats[:5]) if c in candidats]
+        cols = st.multiselect("Colonnes candidates", candidats, default=defaut)
+        st.session_state.colonnes_final = cols
+        st.session_state.historique_selection = None
+    else:
+        st.session_state.seuil_gain = st.number_input(
+            "Seuil de gain relatif (une colonne est gardée si elle réduit la déviance d'au moins ce pourcentage)",
+            min_value=0.0001, max_value=0.05, value=st.session_state.seuil_gain, step=0.0005, format="%.4f")
+        if st.button("Lancer la sélection dynamique", type="primary"):
+            mode = st.session_state.mode_override
+            if mode == "auto":
+                mode = "melange"  # sans resultats chargé, on suppose le mode le plus courant pour la sélection
+            zone = st.empty()
+            historique = []
+
+            def callback(etape_dict):
+                historique.append(etape_dict)
+                with zone.container():
+                    for e in historique:
+                        s = "✓" if e["retenue"] else "⚠"
+                        badge(s, f"{e['colonne']} : gain {e['gain']:.2%} (déviance {e['deviance']:,.0f})".replace(",", " "))
+
+            with st.spinner("Sélection en cours..."):
+                cols, hist, base_dev = b.selection_dynamique(d, candidats, mode, st.session_state.seuil_gain,
+                                                              n_splits=2 if st.session_state.rapide else 3, callback=callback)
+            st.session_state.colonnes_final = cols
+            st.session_state.historique_selection = hist
+        if st.session_state.colonnes_final and st.session_state.historique_selection:
+            st.success(f"Colonnes retenues : {st.session_state.colonnes_final}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent", on_click=aller, args=(-1,), use_container_width=True)
+    peut = bool(st.session_state.colonnes_final) or st.session_state.methode_cols == "manuelle"
+    c2.button("Suivant →", type="primary", disabled=st.session_state.colonnes_final is None,
+             on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 6 — Entraînement, pli par pli, interruptible
+# ============================================================================================
+elif etape == 6:
+    st.markdown("<div class='carte'><h3>🏋️ 11 · Entraînement (validation croisée)</h3>", unsafe_allow_html=True)
+    mode = st.session_state.mode_override
+    if mode == "auto":
+        mode = "melange"
+        st.caption("Mode 'auto' sans fichier resultats chargé : validation en mode 'mélange' par défaut.")
+    d = b.preparer(st.session_state.df, mode)
+
+    sig = signature_actuelle()
+    if st.session_state.train is None or st.session_state.train_signature != sig:
+        params = dict(learning_rate=st.session_state.learning_rate,
+                     max_rounds=200 if st.session_state.rapide else st.session_state.max_rounds)
+        tab = st.session_state.tab_strate if st.session_state.avec_facteur else None
+        st.session_state.train = b.etat_initial(d, st.session_state.algo, st.session_state.colonnes_final, mode,
+                                                2 if st.session_state.rapide else st.session_state.n_splits, params,
+                                                st.session_state.avec_facteur, st.session_state.strate, tab, None)
+        st.session_state.train_signature = sig
+        st.session_state.bundle = None
+        st.info("Réglages pris en compte : entraînement (ré)initialisé.")
+
+    etat = st.session_state.train
+    fait, total = etat["pli_courant"], len(etat["plis"])
+    st.progress(fait / total if total else 0, text=f"Pli {fait} / {total}")
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("▶ Entraîner un pli", disabled=etat["termine"], use_container_width=True):
+        with st.spinner("Entraînement du pli en cours..."):
+            r = b.entrainer_un_pli(etat)
+        st.toast(f"Pli {r['pli']}/{r['sur']} terminé en {r['temps']:.1f}s — déviance {r['deviance_pli']:,.0f}".replace(",", " "))
+        st.rerun()
+    if c2.button("⏭ Entraîner tous les plis restants", disabled=etat["termine"], use_container_width=True,
+                help="Non interruptible une fois lancé — préfère 'un pli' si tu veux pouvoir t'arrêter en cours de route."):
+        barre = st.progress(0.0)
+        while not etat["termine"]:
+            r = b.entrainer_un_pli(etat)
+            barre.progress(etat["pli_courant"] / total)
+        st.rerun()
+    if c3.button("⏹ Interrompre / arrêter ici", disabled=fait == 0, use_container_width=True):
+        etat["termine"] = True
+        etat["interrompu"] = fait < total
+        st.rerun()
+
+    if fait > 0:
+        histo = pd.DataFrame([dict(Pli=i + 1, Déviance_table=np.nan, Déviance_modèle=np.nan) for i in range(fait)])
+        # recalcule les métriques par pli affichées (à partir de oof déjà stocké)
+        lignes = []
+        for i, (tr, va) in enumerate(etat["plis"][:fait]):
+            y_va = d.iloc[va]["DthAmt"].to_numpy(float)
+            p_va = etat["oof"][va]
+            e_va = d.iloc[va]["ExpecAmt"].to_numpy(float)
+            lignes.append(dict(Pli=i + 1, Déviance_table=b.pdev(y_va, e_va), Déviance_modèle=b.pdev(y_va, p_va)))
+        histo = pd.DataFrame(lignes)
+        st.markdown("**Déviance de Poisson par pli**")
+        st.line_chart(histo.set_index("Pli")[["Déviance_table", "Déviance_modèle"]])
+        st.dataframe(histo.style.format({"Déviance_table": "{:,.0f}", "Déviance_modèle": "{:,.0f}"}), use_container_width=True)
+
+        resume = b.resume_hors_pli(etat)
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown(f"<div class='metrique-box'><div class='val'>{resume['deviance_modele']:,.0f}</div>"
+                       f"<div class='lab'>déviance modèle (hors-pli)</div></div>".replace(",", " "), unsafe_allow_html=True)
+        with m2:
+            gain = 1 - resume['deviance_modele'] / resume['deviance_table']
+            st.markdown(f"<div class='metrique-box'><div class='val'>{gain:.1%}</div><div class='lab'>gain vs table</div></div>", unsafe_allow_html=True)
+        with m3:
+            st.markdown(f"<div class='metrique-box'><div class='val'>{resume['somme_pred_reel']:.3f}</div><div class='lab'>somme prédite / réelle</div></div>", unsafe_allow_html=True)
+
+    if etat["termine"] and st.session_state.bundle is None:
+        if etat.get("interrompu"):
+            st.warning(f"Entraînement arrêté après {fait}/{total} plis : l'estimation hors-pli est moins fiable.")
+        if st.button("✅ Finaliser le modèle (entraîne sur toutes les données)", type="primary"):
+            with st.spinner("Entraînement final..."):
+                b.finaliser(etat)
+                st.session_state.bundle = b.construire_bundle(etat)
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent", on_click=aller, args=(-1,), use_container_width=True)
+    c2.button("Voir les résultats →", type="primary", disabled=st.session_state.bundle is None,
+             on_click=aller, args=(1,), use_container_width=True)
+
+
+# ============================================================================================
+# ÉTAPE 7 — Résultats : métriques finales, téléchargement du modèle, prédiction sur resultats
+# ============================================================================================
+elif etape == 7:
+    bundle = st.session_state.bundle
+    st.markdown("<div class='carte'><h3>🏁 Résultats</h3>", unsafe_allow_html=True)
+    if bundle is None:
+        st.warning("Aucun modèle finalisé. Reviens à l'étape Entraînement.")
+    else:
+        r = bundle["resume"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.markdown(f"<div class='metrique-box'><div class='val'>{bundle['algo']}</div><div class='lab'>algorithme</div></div>", unsafe_allow_html=True)
+        m2.markdown(f"<div class='metrique-box'><div class='val'>{r['deviance_modele']:,.0f}</div><div class='lab'>déviance hors-pli</div></div>".replace(",", " "), unsafe_allow_html=True)
+        m3.markdown(f"<div class='metrique-box'><div class='val'>{1 - r['deviance_modele'] / r['deviance_table']:.1%}</div><div class='lab'>gain vs table</div></div>", unsafe_allow_html=True)
+        m4.markdown(f"<div class='metrique-box'><div class='val'>{len(bundle['cols'])}</div><div class='lab'>colonnes utilisées</div></div>", unsafe_allow_html=True)
+        st.write("")
+        st.write(f"**Colonnes du modèle :** {bundle['cols']}")
+        st.write(f"**Facteur comme point de départ :** {'oui — strate ' + str(bundle['strate']) if bundle['avec_facteur'] else 'non'}")
+
+        st.download_button("💾 Télécharger le modèle entraîné (.pkl)", data=b.bundle_to_bytes(bundle),
+                           file_name="modele_montant.pkl", mime="application/octet-stream", use_container_width=True)
+
+        st.markdown("<hr class='separateur'>", unsafe_allow_html=True)
+        st.markdown("**Prédire sur un fichier `resultats` (mêmes colonnes que df, sans DthAmt)**")
+        fichier_res = st.file_uploader("Glisse-dépose le CSV de resultats", type=["csv"], key="upload_resultats")
+        if fichier_res is not None:
+            try:
+                res = b.lire_csv(fichier_res.getvalue())
+                _, _, err = b.nettoyer(st.session_state.df, res)
+                if err:
+                    st.error(err)
+                else:
+                    sub = b.predire(bundle, res)
+                    st.dataframe(sub.head(30), use_container_width=True)
+                    st.download_button("💾 Télécharger la soumission (CSV)", data=sub.to_csv(index=False).encode("utf-8"),
+                                       file_name="soumission_montant.csv", mime="text/csv", use_container_width=True)
+            except Exception as e:
+                st.error(f"Erreur : {e}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    c1.button("← Précédent", on_click=aller, args=(-1,), use_container_width=True)
+    if c2.button("🔄 Recommencer (nouveau df)", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* Palette et mise en forme générale de l'assistant de modélisation */
+:root {
+    --vert-fonce: #0b3d2e;
+    --vert: #0f6e4f;
+    --vert-clair: #e8f5ee;
+    --or: #c9a227;
+    --texte: #1c2b26;
+    --gris: #6b7a75;
+    --fond-carte: #ffffff;
+    --bordure: #dbe6e0;
+}
+
+.stApp {
+    background: linear-gradient(180deg, #f6faf8 0%, #eef5f1 100%);
+}
+
+/* En-tête */
+.entete-app {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 18px 26px;
+    background: linear-gradient(120deg, var(--vert-fonce), var(--vert));
+    border-radius: 16px;
+    color: white;
+    margin-bottom: 6px;
+    box-shadow: 0 6px 20px rgba(11, 61, 46, 0.18);
+}
+.entete-app h1 { margin: 0; font-size: 1.35rem; font-weight: 700; letter-spacing: 0.2px; }
+.entete-app p { margin: 2px 0 0 0; font-size: 0.85rem; opacity: 0.9; }
+.entete-app .puce { font-size: 1.8rem; }
+
+/* Barre d'étapes */
+.barre-etapes { display: flex; gap: 6px; margin: 14px 0 22px 0; flex-wrap: wrap; }
+.etape-item {
+    flex: 1; min-width: 90px; text-align: center; padding: 8px 6px; border-radius: 10px;
+    font-size: 0.72rem; font-weight: 600; background: #eef2f0; color: var(--gris);
+    border: 1px solid var(--bordure);
+}
+.etape-item.faite { background: var(--vert-clair); color: var(--vert); border-color: var(--vert); }
+.etape-item.active { background: var(--vert); color: white; border-color: var(--vert-fonce);
+    box-shadow: 0 3px 10px rgba(15, 110, 79, 0.35); transform: scale(1.03); }
+
+/* Cartes */
+.carte {
+    background: var(--fond-carte); border: 1px solid var(--bordure); border-radius: 14px;
+    padding: 18px 20px; margin-bottom: 14px; box-shadow: 0 2px 10px rgba(11, 61, 46, 0.05);
+}
+.carte h3 { margin-top: 0; color: var(--vert-fonce); font-size: 1.05rem; }
+.carte-titre-icone { display:flex; align-items:center; gap:8px; }
+
+/* Badges de messages ✓ ⚠ ℹ */
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    font-size: 0.78rem; font-weight: 600; margin: 2px 0; }
+.badge-ok { background: #e4f6ea; color: #1e7d3c; }
+.badge-warn { background: #fdf1de; color: #a0621c; }
+.badge-info { background: #e8f0fc; color: #2457a8; }
+.ligne-message { display:flex; gap:8px; align-items:flex-start; padding: 4px 0; font-size: 0.88rem; color: var(--texte); }
+
+/* Métrique en évidence */
+.metrique-box { background: var(--vert-clair); border-radius: 12px; padding: 12px 16px; text-align:center; border:1px solid var(--vert); }
+.metrique-box .val { font-size: 1.5rem; font-weight: 800; color: var(--vert-fonce); }
+.metrique-box .lab { font-size: 0.72rem; color: var(--gris); text-transform: uppercase; letter-spacing: 0.4px; }
+
+/* Boutons Streamlit */
+div.stButton > button {
+    border-radius: 10px; font-weight: 600; border: 1px solid var(--vert);
+}
+div.stButton > button[kind="primary"] { background: var(--vert); border-color: var(--vert-fonce); }
+div.stButton > button[kind="primary"]:hover { background: var(--vert-fonce); }
+
+/* Tag colonne calculée */
+.tag-col { display:inline-block; background:#f1f6f3; border:1px solid var(--bordure); border-radius:8px;
+    padding:2px 8px; margin:2px; font-size:0.78rem; color: var(--vert-fonce); }
+
+hr.separateur { border: none; border-top: 1px solid var(--bordure); margin: 18px 0; }
+        
