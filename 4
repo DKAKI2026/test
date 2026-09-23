@@ -194,29 +194,21 @@ def compute_importance(df, mode, candidates, w0, n_splits, seeds, max_rounds, pa
     return (imp_mean / total if total > 0 else imp_mean).sort_values(ascending=False)
 
 
-def select_features(importance, threshold_factor=1.0, min_feats=5, max_feats=None, verbose=True):
-    """
-    Seuil RELATIF au nombre de candidats, pas une valeur fixe arbitraire :
-        seuil = threshold_factor x (1 / nb_candidats)
-    threshold_factor=1.0 (defaut) -> une colonne doit avoir au moins l'importance moyenne
-    ("above-average importance") pour etre retenue. >1.0 = plus strict, <1.0 = plus permissif.
-    """
-    n = len(importance)
-    baseline = 1.0 / n if n > 0 else 0.0
-    threshold = threshold_factor * baseline
+def select_features(importance, threshold=0.01, min_feats=5, max_feats=None, verbose=True):
+    """Seuil absolu fixe (defaut 1/100 = 1% de l'importance totale normalisee)."""
     selected = importance[importance >= threshold].index.tolist()
     if len(selected) < min_feats:
         selected = importance.head(min_feats).index.tolist()
     if max_feats:
         selected = selected[:max_feats]
     if verbose:
-        print(f"\nImportance des candidats (gain normalise) — seuil = {threshold_factor:.1f} x moyenne "
-              f"= {threshold:.1%} (moyenne sur {n} candidats = {baseline:.1%}) :")
+        print(f"\nImportance des candidats (gain normalise) — seuil = {threshold:.1%} :")
         for f, v in importance.items():
             marque = "garde " if f in selected else "ecarte"
             print(f"  [{marque}] {f:<16s} {v:.4f}")
         print(f"-> {len(selected)} colonnes retenues sur {len(importance)} candidates : {selected}")
     return selected
+   
 
 
 # ============================================================================================
