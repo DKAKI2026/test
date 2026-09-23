@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DÉFI MORTALITÉ  : prédire DthAmt (montant des décès) UNIQUEMENT.
+DÉFI MORTALITÉ (données ICA agrégées) : prédire DthAmt (montant des décès) UNIQUEMENT.
 VERSION LightGBM + SÉLECTION DYNAMIQUE DES FEATURES.
 
 FICHIER UNIQUE — contenu
@@ -208,7 +208,6 @@ def select_features(importance, threshold=0.01, min_feats=5, max_feats=None, ver
             print(f"  [{marque}] {f:<16s} {v:.4f}")
         print(f"-> {len(selected)} colonnes retenues sur {len(importance)} candidates : {selected}")
     return selected
-   
 
 
 # ============================================================================================
@@ -281,7 +280,7 @@ def verifier_donnees(df, resultats=None, verbose=True):
 # ============================================================================================
 def run(df, resultats=None, mode="auto", n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
         params=None, verbose=True, save_path=None,
-        feature_selection=True, selection_threshold_factor=1.0, selection_min_feats=5,
+        feature_selection=True, selection_threshold=0.01, selection_min_feats=5,
         selection_seeds=(0,), selection_max_rounds=800):
     params = dict(PARAMS, **(params or {}))
     miss = [c for c in REQUIRED + DF_EXTRA + [TARGET] if c not in df.columns]
@@ -304,7 +303,7 @@ def run(df, resultats=None, mode="auto", n_splits=5, seeds=(0, 1, 2), max_rounds
     if feature_selection:
         imp = compute_importance(df, mode, candidates, w0, n_splits, selection_seeds,
                                    selection_max_rounds, params)
-        feats = select_features(imp, selection_threshold_factor, selection_min_feats, verbose=verbose)
+        feats = select_features(imp, selection_threshold, selection_min_feats, verbose=verbose)
     else:
         feats = candidates
         if verbose:
