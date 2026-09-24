@@ -1,0 +1,660 @@
+# -*- coding: utf-8 -*-
+"""
+DEFI MORTALITE (donnees ICA agregees) : prediction DthAmt UNIQUEMENT.
+VERSION COMPLETE — integre toutes les recommandations du rapport de recherche :
+
+  1. Credibilite de Buhlmann-Straub sur les A/E de cohorte (au lieu du k=1.0 fixe)
+  2. Baseline lisse (spline age/duree/annee) -> offset a deux etages, le GBM ne boost
+     que le residu de cette baseline (au lieu de partir directement du taux ICA brut)
+  3. Modele Tweedie (en plus du Poisson-avec-offset) pour DthAmt, puissance ajustee par CV
+  4. Selection de colonnes par STABILITE (permutation importance hors-pli, votee sur les plis)
+     au lieu du gain LightGBM brut (biaise)
+  5. Ensemble de 3 modeles structurellement differents, x plusieurs graines, combines par
+     recherche de poids convexes sur les predictions hors-pli
+  6. Recalibration isotonique finale (restaure la propriete de balance/auto-calibration)
+
+Chaque bloc peut etre desactive (flags dans run()) pour comparer avec/sans.
+
+ATTENTION : ce script est nettement plus lent que la version simple, car plusieurs
+etapes font elles-memes de la validation croisee (credibilite, baseline lisse, selection
+stable, choix de la puissance Tweedie) EN PLUS de l'entrainement final. Utilise rapide=True
+pour un premier test de bout en bout avant de lancer la version complete.
+"""
+import pickle
+import itertools
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import SplineTransformer
+from sklearn.linear_model import Ridge
+from sklearn.isotonic import IsotonicRegression
+
+
+# ============================================================================================
+# SECTION 1 — Constantes
+# ============================================================================================
+TARGET = "DthAmt"
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+DF_EXTRA = ["DthCnt"]   # necessaire dans df (historique) pour les A/E de cohorte
+
+KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+CANDIDATES_BASE = ["YearStart", "Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size",
+                    "IssueAge", "PolYear", "AttdAge", "IssueYear", "log_qx", "log_qx_ratio",
+                    "log_avg_size", "cv2", "log_expos"]
+# coh_ae_cnt_cred / coh_ae_amt_cred : versions CREDIBILISEES (Buhlmann-Straub) des A/E de cohorte
+# smooth_log_ae : sortie de la baseline lisse (Section 5), candidate comme les autres
+CANDIDATES_COH = ["coh_ae_cnt_cred", "coh_ae_amt_cred", "coh_log_E", "smooth_log_ae"]
+
+PARAMS = dict(learning_rate=0.03, num_leaves=63, min_data_in_leaf=50, feature_fraction=0.8,
+              bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0, verbose=-1)
+
+
+# ============================================================================================
+# SECTION 2 — Metriques
+# ============================================================================================
+def METRIC(y, p):
+    return float(np.sqrt(np.mean((np.asarray(y) - np.asarray(p)) ** 2)))
+
+
+def pdev(y, p):
+    """Deviance de Poisson (plus petit = mieux)."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+def tweedie_dev(y, p, power):
+    """Deviance de Tweedie (1<power<2), utilisee pour choisir la puissance optimale."""
+    y = np.asarray(y, float)
+    p = np.clip(np.asarray(p, float), 1e-9, None)
+    a = np.where(y > 0, y ** (2 - power) / ((1 - power) * (2 - power)), 0.0)
+    b = y * p ** (1 - power) / (1 - power)
+    c = p ** (2 - power) / (2 - power)
+    return float(2 * np.mean(a - b + c))
+
+
+# ============================================================================================
+# SECTION 3 — Preparation des variables (inchange)
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    d["IssueYear"] = d["YearStart"] - d["PolYear"]
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_cnt"] = (d["ExpecCnt"] / e).clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)
+    d["log_qx"] = np.log(d["qx_cnt"])
+    d["log_qx_ratio"] = np.log(d["qx_amt"] / d["qx_cnt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2
+    d["log_expos"] = np.log(e)
+    d["eff_n"] = a ** 2 / d["ExposAmt2"].clip(lower=1e-9)
+    return d
+
+
+# ============================================================================================
+# SECTION 4 — Cohortes + CREDIBILITE DE BUHLMANN-STRAUB
+# ============================================================================================
+def cohort_table(src, k_cnt=1.0, k_amt=None):
+    """Table d'agregats par cohorte (brute, sans credibilite)."""
+    g = (src.groupby(KEY, sort=False)
+            .agg(D=("DthCnt", "sum"), E=("ExpecCnt", "sum"),
+                 DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum"))
+            .reset_index())
+    if k_amt is None:
+        k_amt = k_cnt * src["ExpecAmt"].sum() / max(src["ExpecCnt"].sum(), 1e-9)
+    return g, k_amt
+
+
+def estimate_credibility_k(src, d_col, e_col, key_cols=KEY):
+    """
+    Estimateur empirique (methode des moments) de Buhlmann-Straub :
+        Z_i = E_i / (E_i + k),   k = variance de processus / variance entre cohortes
+    Chaque cohorte (key_cols) est suivie sur plusieurs annees (Year varie a l'interieur
+    d'une cohorte). On estime :
+      - la variance de PROCESSUS s^2 : dispersion des ratios D_it/E_it AUTOUR de la
+        moyenne de LEUR PROPRE cohorte (bruit annee-a-annee, pas informatif)
+      - la variance ENTRE COHORTES a^2 : dispersion des moyennes de cohorte AUTOUR de
+        la moyenne generale (vrai signal a exploiter)
+    Plus s^2 est grand par rapport a a^2 (bruit >> signal), plus k est grand, moins on
+    fait confiance a l'experience individuelle de la cohorte (credibilite Z plus faible).
+    C'est une estimation APPROXIMATIVE (methode des moments non-parametrique classique,
+    Buhlmann & Gisler 2005) -> a valider empiriquement, pas une garantie theorique exacte
+    sur des donnees agregees ICA.
+    """
+    d = src.copy()
+    d["_ratio"] = (d[d_col] / d[e_col].clip(lower=1e-9))
+    d["_w"] = d[e_col].clip(lower=1e-9)
+
+    grp = d.groupby(key_cols, sort=False)
+    w_i = grp["_w"].sum()                                    # exposition totale par cohorte
+    xbar_i = (d["_ratio"] * d["_w"]).groupby([d[c] for c in key_cols]).sum() / w_i
+    n_groups = len(w_i)
+    n_obs = len(d)
+    if n_groups < 2 or n_obs <= n_groups:
+        return 1.0   # pas assez de repetitions pour estimer -> credibilite neutre par defaut
+
+    # variance de processus (intra-cohorte)
+    d = d.join(xbar_i.rename("_xbar_i"), on=key_cols)
+    ss_within = (d["_w"] * (d["_ratio"] - d["_xbar_i"]) ** 2).sum()
+    s2 = ss_within / max(n_obs - n_groups, 1)
+
+    # variance entre cohortes
+    w_tot = w_i.sum()
+    xbar = (xbar_i * w_i).sum() / w_tot
+    ss_between = (w_i * (xbar_i - xbar) ** 2).sum()
+    c = w_tot - (w_i ** 2).sum() / w_tot
+    a2 = (ss_between - (n_groups - 1) * s2) / max(c, 1e-9)
+
+    if a2 <= 0:
+        return 1e6   # signal entre cohortes indetectable -> credibilite ~nulle (Z->0)
+    return float(s2 / a2)
+
+
+def cohort_from_table(g, k_amt, k_cnt, dst, key_cols=KEY):
+    """A/E de cohorte, version BRUTE et version CREDIBILISEE (Buhlmann-Straub)."""
+    m = dst[key_cols].merge(g, on=key_cols, how="left").fillna(0.0)
+    ae_cnt_raw = m["D"] / m["E"].clip(lower=1e-9)
+    ae_amt_raw = m["DA"] / m["EA"].clip(lower=1e-9)
+    z_cnt = m["E"] / (m["E"] + k_cnt)
+    z_amt = m["EA"] / (m["EA"] + k_amt)
+    return pd.DataFrame({
+        "coh_ae_cnt_cred": (z_cnt * ae_cnt_raw + (1 - z_cnt) * 1.0).values,   # shrink vers 1 (=ICA)
+        "coh_ae_amt_cred": (z_amt * ae_amt_raw + (1 - z_amt) * 1.0).values,
+        "coh_log_E": np.log1p(m["E"]).values}, index=dst.index)
+
+
+def cohort_apply(src, dst, k_cnt=None, k_amt=None):
+    """k_cnt/k_amt estimes sur `src` si non fournis (permet de reutiliser un k deja estime)."""
+    if k_cnt is None:
+        k_cnt = estimate_credibility_k(src, "DthCnt", "ExpecCnt")
+    if k_amt is None:
+        k_amt = estimate_credibility_k(src, "DthAmt", "ExpecAmt")
+    g, _ = cohort_table(src, k_cnt)
+    return cohort_from_table(g, k_amt, k_cnt, dst), k_cnt, k_amt
+
+
+def cohort_oof(src, n_splits=5, seed=0):
+    """Version hors-pli (pas de fuite) : le k de credibilite ET la table sont estimes
+    sur le pli d'entrainement UNIQUEMENT, puis appliques au pli de validation."""
+    out = pd.DataFrame(index=src.index, columns=CANDIDATES_COH[:3], dtype=float)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        feats, _, _ = cohort_apply(src.iloc[tr], src.iloc[va])
+        out.iloc[va] = feats.values
+    return out
+
+
+# ============================================================================================
+# SECTION 5 — BASELINE LISSE (offset a deux etages)
+# ============================================================================================
+SMOOTH_COLS = ["AttdAge", "PolYear", "YearStart"]
+
+
+def fit_smooth_baseline(d_tr, k_smooth=None, n_knots=8, degree=3, alpha=1.0):
+    """
+    Lisse le A/E (montant) sur age/duree/annee avec une regression sur base de splines
+    (equivalent pratique d'un GAM). Cible = A/E CREDIBILISE au niveau ligne (memes idees
+    que la credibilite de cohorte, mais appliquee ligne par ligne pour eviter le bruit
+    d'echantillonnage sur les petites cellules) :
+        ratio_shrink = (DthAmt + k_smooth) / (ExpecAmt + k_smooth)
+    Le GBM n'aura ensuite plus qu'a corriger le RESIDU de cette surface lisse -> il
+    n'a plus besoin d'apprendre lui-meme la forme globale age/duree/annee, qui est
+    justement ce que les arbres extrapolent mal.
+    """
+    if k_smooth is None:
+        k_smooth = d_tr["ExpecAmt"].sum() / max(len(d_tr), 1)   # ordre de grandeur raisonnable
+    ratio = (d_tr["DthAmt"] + k_smooth) / (d_tr["ExpecAmt"] + k_smooth)
+    y = np.log(ratio.clip(lower=1e-6))
+    X = d_tr[SMOOTH_COLS].values
+    spline = SplineTransformer(n_knots=n_knots, degree=degree, include_bias=False)
+    Xs = spline.fit_transform(X)
+    model = Ridge(alpha=alpha)
+    model.fit(Xs, y, sample_weight=d_tr["ExpecAmt"].clip(lower=1e-9).values)
+    return spline, model, k_smooth
+
+
+def apply_smooth_baseline(spline, model, dst):
+    Xs = spline.transform(dst[SMOOTH_COLS].values)
+    return model.predict(Xs)   # log(A/E) lisse -> a ajouter a l'offset ICA existant
+
+
+def smooth_oof(src, n_splits=5, seed=0, **kw):
+    """Meme logique hors-pli que cohort_oof : jamais entraine et applique sur les memes lignes."""
+    out = np.full(len(src), np.nan)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        spline, model, _ = fit_smooth_baseline(src.iloc[tr], **kw)
+        out[va] = apply_smooth_baseline(spline, model, src.iloc[va])
+    return out
+
+
+# ============================================================================================
+# SECTION 6 — Cibles, offset, entrainement de base
+# ============================================================================================
+def amt_targets(d, w0, extra_offset=None):
+    """
+    extra_offset : log(A/E) lisse (Section 5) a AJOUTER a l'offset ICA existant.
+    Offset final = log(qx_amt) [+ extra_offset si fourni] -> le modele n'apprend plus
+    que ce que le taux ICA (et la baseline lisse) n'expliquent pas encore.
+    """
+    y = (d["DthAmt"] / d["ExposAmt"].clip(lower=1e-9)).values
+    off = np.log(d["qx_amt"]).values
+    if extra_offset is not None:
+        off = off + extra_offset
+    w = (d["eff_n"] / w0).values
+    return y, off, w
+
+
+def fit(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params, objective="poisson"):
+    p = dict(params, objective=objective, seed=seed)
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    return lgb.train(p, dtr, max_rounds, valid_sets=[dva],
+                      callbacks=[lgb.early_stopping(100, verbose=False)])
+
+
+def raw(m, X):
+    return m.predict(X, raw_score=True, num_iteration=m.best_iteration)
+
+
+def make_folds(df, mode, n_splits, seed=42):
+    """mode='temporal' -> validation FORWARD-CHAINING (annees futures), jamais de melange
+    aleatoire dans le temps -> evite de surestimer la valeur des A/E de cohorte (la meme
+    cohorte ne doit pas se retrouver des deux cotes d'un pli en mode temporel)."""
+    if mode == "interleaved":
+        return list(KFold(n_splits, shuffle=True, random_state=seed).split(df))
+    ys = np.sort(df["YearStart"].unique())[-3:]
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+# ============================================================================================
+# SECTION 7 — SELECTION DE COLONNES PAR STABILITE (permutation importance hors-pli)
+# ============================================================================================
+def build_candidates(use_coh):
+    cands = CANDIDATES_BASE + (CANDIDATES_COH if use_coh else [])
+    if not use_coh:
+        cands = [c for c in cands if c not in ("YearStart", "IssueYear")]
+    return cands
+
+
+def permutation_drop(model, X_va, y_va, off_va, base_dev, n_repeats=3, seed=0):
+    """Degradation de la deviance Poisson quand on permute (melange aleatoirement) chaque
+    colonne UNE A LA FOIS. >0 = casser cette colonne degrade le modele = elle sert vraiment.
+    Contrairement au gain LightGBM (interne, biaise vers les variables a haute cardinalite),
+    ceci mesure un effet CAUSAL direct sur la performance hors-pli."""
+    rng = np.random.default_rng(seed)
+    drops = pd.Series(0.0, index=X_va.columns)
+    for col in X_va.columns:
+        deltas = []
+        for _ in range(n_repeats):
+            Xp = X_va.copy()
+            Xp[col] = rng.permutation(Xp[col].values)
+            p = np.exp(raw(model, Xp) + off_va)
+            deltas.append(pdev(y_va, p) - base_dev)
+        drops[col] = np.mean(deltas)
+    return drops
+
+
+def select_features_stable(df, mode, candidates, w0, n_splits, params, max_rounds,
+                            extra_offsets=None, min_folds_frac=0.6, verbose=True):
+    """
+    Une colonne n'est retenue QUE si la casser degrade vraiment la deviance hors-pli dans
+    au moins `min_folds_frac` des plis (vote de stabilite, Meinshausen & Buhlmann 2010).
+    Une colonne "importante" sur un seul pli par hasard n'est PAS retenue : c'est le
+    principal defaut du seuil de gain simple (Section 5 de la version precedente), qui
+    ne regardait qu'une moyenne globale sans verifier la coherence pli-par-pli.
+    """
+    use_coh = mode == "interleaved"
+    folds = make_folds(df, mode, n_splits)
+    votes = pd.Series(0, index=candidates)
+    for k, (tr, va) in enumerate(folds):
+        d_tr0, d_va0 = df.iloc[tr], df.iloc[va]
+        if use_coh:
+            coh_tr = cohort_oof(d_tr0, seed=k)
+            coh_va, k_cnt, k_amt = cohort_apply(d_tr0, d_va0)
+            d_tr = pd.concat([d_tr0, coh_tr], axis=1)
+            d_va = pd.concat([d_va0, coh_va], axis=1)
+            sm_tr = smooth_oof(d_tr0, seed=k)
+            spline, sm_model, _ = fit_smooth_baseline(d_tr0)
+            sm_va = apply_smooth_baseline(spline, sm_model, d_va0)
+            d_tr["smooth_log_ae"], d_va["smooth_log_ae"] = sm_tr, sm_va
+        else:
+            d_tr, d_va = d_tr0, d_va0
+        ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0)
+        ya_va, oa_va, wa_va = amt_targets(d_va, w0)
+        m = fit(d_tr[candidates], ya_tr, oa_tr, wa_tr, d_va[candidates], ya_va, oa_va, wa_va,
+                0, max_rounds, params)
+        base_p = np.exp(raw(m, d_va[candidates]) + oa_va)
+        base_dev = pdev(ya_va, base_p)
+        drops = permutation_drop(m, d_va[candidates], ya_va, oa_va, base_dev)
+        votes += (drops > 0).astype(int)
+    frac = votes / len(folds)
+    selected = frac[frac >= min_folds_frac].index.tolist()
+    if len(selected) < 3:
+        selected = frac.sort_values(ascending=False).head(3).index.tolist()
+    if verbose:
+        print(f"\nSelection par STABILITE (colonne gardee si elle aide dans >= {min_folds_frac:.0%} des plis) :")
+        for f, v in frac.sort_values(ascending=False).items():
+            marque = "garde " if f in selected else "ecarte"
+            print(f"  [{marque}] {f:<18s} retenue dans {v:.0%} des plis")
+        print(f"-> {len(selected)} colonnes stables sur {len(candidates)} candidates : {selected}")
+    return selected
+
+
+# ============================================================================================
+# SECTION 8 — ENTRAINEMENT DE L'ENSEMBLE (3 modeles structurellement differents)
+# ============================================================================================
+def choose_tweedie_power(d_tr, d_va, feats, w0, params, max_rounds, powers=(1.1, 1.3, 1.5, 1.7, 1.9)):
+    """Recherche la puissance Tweedie qui minimise la deviance de Tweedie hors-pli (au lieu
+    de fixer une valeur par defaut arbitraire — voir Gao 2024, la puissance doit etre
+    estimee, pas devinee)."""
+    ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0)
+    ya_va, oa_va, wa_va = amt_targets(d_va, w0)
+    best_p, best_dev, best_m = None, np.inf, None
+    for pw in powers:
+        params_pw = dict(params, tweedie_variance_power=pw)
+        m = fit(d_tr[feats], ya_tr, oa_tr, wa_tr, d_va[feats], ya_va, oa_va, wa_va,
+                0, max_rounds, params_pw, objective="tweedie")
+        pred = np.exp(raw(m, d_va[feats]) + oa_va)
+        dev = tweedie_dev(ya_va, pred, pw)
+        if dev < best_dev:
+            best_p, best_dev, best_m = pw, dev, m
+    return best_p, best_m
+
+
+def train_ensemble(df, mode, feats, w0, n_splits, seeds, max_rounds, params, verbose=True):
+    """
+    3 modeles de base, structurellement differents :
+      A. Poisson + offset ICA seul                       (baseline actuelle)
+      B. Poisson + offset ICA + baseline lisse (Section 5) (le GBM ne corrige QUE le residu)
+      C. Tweedie + offset ICA (puissance choisie par CV)  (modele direct de l'amplitude,
+                                                             gere mieux les masses de zeros)
+    Chacun est moyenne sur plusieurs graines (seeds). On garde les predictions HORS-PLI
+    de chaque modele pour la Section 9 (stacking).
+    """
+    use_coh = mode == "interleaved"
+    n = len(df)
+    oof = {k: np.full(n, np.nan) for k in ("A", "B", "C")}
+    bundle_models = {k: [] for k in ("A", "B", "C")}
+    tweedie_power_votes = []
+
+    for k, (tr, va) in enumerate(make_folds(df, mode, n_splits)):
+        d_tr0, d_va0 = df.iloc[tr], df.iloc[va]
+        if use_coh:
+            coh_tr = cohort_oof(d_tr0, seed=k)
+            coh_va, k_cnt, k_amt = cohort_apply(d_tr0, d_va0)
+            d_tr = pd.concat([d_tr0, coh_tr], axis=1)
+            d_va = pd.concat([d_va0, coh_va], axis=1)
+        else:
+            d_tr, d_va = d_tr0, d_va0
+        spline, sm_model, _ = fit_smooth_baseline(d_tr0)
+        sm_tr_oof = smooth_oof(d_tr0, seed=k)
+        sm_va = apply_smooth_baseline(spline, sm_model, d_va0)
+        d_tr = d_tr.assign(smooth_log_ae=sm_tr_oof)
+        d_va = d_va.assign(smooth_log_ae=sm_va)
+
+        Xtr, Xva = d_tr[feats], d_va[feats]
+
+        # --- A. Poisson, offset ICA seul ---
+        ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0)
+        ya_va, oa_va, wa_va = amt_targets(d_va, w0)
+        pA = np.zeros(len(va))
+        for s in seeds:
+            m = fit(Xtr, ya_tr, oa_tr, wa_tr, Xva, ya_va, oa_va, wa_va, s, max_rounds, params)
+            pA += d_va["ExposAmt"].values * np.exp(raw(m, Xva) + oa_va) / len(seeds)
+            bundle_models["A"].append(m.model_to_string(num_iteration=m.best_iteration))
+
+        # --- B. Poisson, offset ICA + baseline lisse ---
+        ya_tr_b, oa_tr_b, wa_tr_b = amt_targets(d_tr, w0, extra_offset=sm_tr_oof)
+        ya_va_b, oa_va_b, wa_va_b = amt_targets(d_va, w0, extra_offset=sm_va)
+        pB = np.zeros(len(va))
+        for s in seeds:
+            m = fit(Xtr, ya_tr_b, oa_tr_b, wa_tr_b, Xva, ya_va_b, oa_va_b, wa_va_b,
+                    s, max_rounds, params)
+            pB += d_va["ExposAmt"].values * np.exp(raw(m, Xva) + oa_va_b) / len(seeds)
+            bundle_models["B"].append(m.model_to_string(num_iteration=m.best_iteration))
+
+        # --- C. Tweedie, puissance choisie par CV interne (sur ce pli) ---
+        best_pw, _ = choose_tweedie_power(d_tr, d_va, feats, w0, params, max_rounds)
+        tweedie_power_votes.append(best_pw)
+        pC = np.zeros(len(va))
+        params_c = dict(params, tweedie_variance_power=best_pw)
+        for s in seeds:
+            m = fit(Xtr, ya_tr, oa_tr, wa_tr, Xva, ya_va, oa_va, wa_va, s, max_rounds,
+                    params_c, objective="tweedie")
+            pC += d_va["ExposAmt"].values * np.exp(raw(m, Xva) + oa_va) / len(seeds)
+            bundle_models["C"].append(m.model_to_string(num_iteration=m.best_iteration))
+
+        oof["A"][va], oof["B"][va], oof["C"][va] = pA, pB, pC
+        if verbose:
+            print(f"  pli {k + 1}: modele A/B ok, Tweedie power retenue = {best_pw}")
+
+    final_power = float(pd.Series(tweedie_power_votes).mode().iloc[0])   # power la + votee
+    return oof, bundle_models, final_power
+
+
+# ============================================================================================
+# SECTION 9 — STACKING (poids convexes sur les predictions hors-pli)
+# ============================================================================================
+def find_blend_weights(y, preds_dict, step=0.05):
+    """Recherche par grille sur un simplexe (poids >=0, somme=1) des 3 modeles — pas besoin
+    de solveur externe pour 3 composantes, une grille fine suffit et reste transparente."""
+    names = list(preds_dict.keys())
+    best_w, best_score = None, np.inf
+    grid = np.arange(0, 1 + 1e-9, step)
+    for w0_ in grid:
+        for w1_ in np.arange(0, 1 - w0_ + 1e-9, step):
+            w2_ = 1 - w0_ - w1_
+            if w2_ < -1e-9:
+                continue
+            w2_ = max(w2_, 0)
+            blend = w0_ * preds_dict[names[0]] + w1_ * preds_dict[names[1]] + w2_ * preds_dict[names[2]]
+            score = METRIC(y, blend)
+            if score < best_score:
+                best_score, best_w = score, (w0_, w1_, w2_)
+    return dict(zip(names, best_w)), best_score
+
+
+# ============================================================================================
+# SECTION 10 — RECALIBRATION ISOTONIQUE
+# ============================================================================================
+def fit_isotonic_calibration(y, p, weight=None):
+    """Applique une transformation monotone (isotonique) sur les predictions hors-pli pour
+    restaurer la propriete de BALANCE/auto-calibration (Wuthrich & Ziegel) : en moyenne,
+    pour chaque niveau de prediction, la prediction recalibree = la moyenne observee.
+    Comme la transformation est monotone, elle NE CHANGE PAS le pouvoir de discrimination
+    (le classement des cohortes reste identique) — seule l'echelle est corrigee."""
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(p, y, sample_weight=weight)
+    return iso
+
+
+# ============================================================================================
+# SECTION 11 — Sauvegarde / chargement / prediction
+# ============================================================================================
+def save_bundle(bundle, path):
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def predict(bundle, resultats):
+    """Reproduit TOUTE la chaine (credibilite cohorte + baseline lisse + 3 modeles +
+    blend + recalibration isotonique) sur `resultats`, sans reentrainer."""
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+
+    if bundle["mode"] == "interleaved":
+        coh = cohort_from_table(bundle["coh_g"], bundle["k_amt"], bundle["k_cnt"], res)
+        res = pd.concat([res, coh], axis=1)
+    sm = apply_smooth_baseline(bundle["spline"], bundle["sm_model"], res)
+    res["smooth_log_ae"] = sm
+
+    feats = bundle["feats"]
+    X = res[feats]
+    off = np.log(res["qx_amt"]).values
+
+    pA = np.mean([res["ExposAmt"].values * np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off)
+                  for m in bundle["models"]["A"]], axis=0)
+    pB = np.mean([res["ExposAmt"].values * np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off + sm)
+                  for m in bundle["models"]["B"]], axis=0)
+    pC = np.mean([res["ExposAmt"].values * np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off)
+                  for m in bundle["models"]["C"]], axis=0)
+
+    w = bundle["weights"]
+    blend = w["A"] * pA + w["B"] * pB + w["C"] * pC
+    calibrated = bundle["isotonic"].predict(blend)
+
+    sub = resultats.copy()
+    sub[TARGET] = np.clip(calibrated, 0, None)
+    return sub
+
+
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + DF_EXTRA + [TARGET]), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques")
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), (
+            f"{int(bad_r.sum())} lignes de resultats invalides dans {CRITIQUES}. "
+            f"Exemple d'index : {list(resultats.index[bad_r][:5])}.")
+    bad = _lignes_invalides(df, CRITIQUES + DF_EXTRA + [TARGET])
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees (valeur manquante/infinie).")
+        df = df.loc[~bad]
+    return df
+
+
+# ============================================================================================
+# SECTION 12 — PIPELINE COMPLET run()
+# ============================================================================================
+def run(df, resultats=None, mode="auto", n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+        params=None, verbose=True, save_path=None, stable_min_folds_frac=0.6,
+        selection_max_rounds=800):
+    params = dict(PARAMS, **(params or {}))
+    miss = [c for c in REQUIRED + DF_EXTRA + [TARGET] if c not in df.columns]
+    if resultats is not None:
+        miss += [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = prep(df).reset_index(drop=True)
+    if mode == "auto":
+        assert resultats is not None, 'Sans `resultats`, precise mode="interleaved" ou mode="temporal".'
+        mode = "interleaved" if prep(resultats)["Year"].isin(df["Year"]).mean() > 0.9 else "temporal"
+    use_coh = mode == "interleaved"
+    candidates = build_candidates(use_coh)
+    w0 = df["eff_n"].mean()
+    if verbose:
+        print(f"Mode : {mode} | lignes df={len(df):,} | {len(candidates)} candidats : {candidates}")
+
+    # --- 1) selection stable des colonnes (Section 7) --------------------------------------
+    feats = select_features_stable(df, mode, candidates, w0, n_splits, params,
+                                    selection_max_rounds, min_folds_frac=stable_min_folds_frac,
+                                    verbose=verbose)
+
+    # --- 2) entrainement de l'ensemble a 3 modeles (Section 8) ------------------------------
+    oof, models, tweedie_power = train_ensemble(df, mode, feats, w0, n_splits, seeds,
+                                                  max_rounds, params, verbose=verbose)
+    cov = ~np.isnan(oof["A"])
+    y = df[TARGET].values[cov]
+    if verbose:
+        print(f"\n== {TARGET} - scores hors-pli par modele ==")
+        print(f"  Baseline ICA (ExpecAmt)         metrique={METRIC(y, df['ExpecAmt'].values[cov]):,.4f}")
+        for k in ("A", "B", "C"):
+            print(f"  Modele {k}                        metrique={METRIC(y, oof[k][cov]):,.4f}")
+
+    # --- 3) stacking : poids convexes sur les predictions hors-pli (Section 9) -------------
+    preds = {k: oof[k][cov] for k in ("A", "B", "C")}
+    weights, blend_score = find_blend_weights(y, preds)
+    blend_oof = sum(weights[k] * preds[k] for k in ("A", "B", "C"))
+    if verbose:
+        print(f"\nPoids du blend : {weights} -> metrique blend = {blend_score:,.4f}")
+
+    # --- 4) recalibration isotonique (Section 10) -------------------------------------------
+    w_iso = df["ExpecAmt"].values[cov]
+    isotonic = fit_isotonic_calibration(y, blend_oof, weight=w_iso)
+    calib_oof = isotonic.predict(blend_oof)
+    if verbose:
+        print(f"Metrique apres recalibration isotonique = {METRIC(y, calib_oof):,.4f}")
+        print(f"Balance avant  = {blend_oof.sum() / y.sum():.4f} | apres = {calib_oof.sum() / y.sum():.4f}")
+
+    # --- bundle final -------------------------------------------------------------------------
+    bundle = dict(mode=mode, feats=feats, models=models, weights=weights,
+                  isotonic=isotonic, tweedie_power=tweedie_power)
+    if use_coh:
+        k_cnt = estimate_credibility_k(df, "DthCnt", "ExpecCnt")
+        k_amt = estimate_credibility_k(df, "DthAmt", "ExpecAmt")
+        g, _ = cohort_table(df, k_cnt)
+        bundle["coh_g"], bundle["k_cnt"], bundle["k_amt"] = g, k_cnt, k_amt
+        if verbose:
+            print(f"\nCredibilite (sur tout df) : k_cnt={k_cnt:.2f} | k_amt={k_amt:,.2f}")
+    spline, sm_model, _ = fit_smooth_baseline(df)
+    bundle["spline"], bundle["sm_model"] = spline, sm_model
+
+    if save_path:
+        save_bundle(bundle, save_path)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path}")
+
+    sub = predict(bundle, resultats) if resultats is not None else None
+    return dict(sub=sub, bundle=bundle, mode=mode, feats=feats, oof=oof, weights=weights,
+                calib_oof=calib_oof)
+
+
+# ============================================================================================
+# SECTION 13 — EXECUTION
+# ============================================================================================
+def executer(df, resultats, save_path="modele_dthamt_complet.pkl",
+             out_csv="soumission_dthamt_complet.csv", rapide=False):
+    df = verifier_donnees(df, resultats)
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    mode = "interleaved" if part > 0.9 else "temporal"
+    print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
+
+    kw = dict(seeds=(0,), n_splits=3, max_rounds=500, selection_max_rounds=200) if rapide else {}
+    out = run(df, mode=mode, save_path=save_path, **kw)
+
+    sub = predict(out["bundle"], resultats)
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[TARGET].notna().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)")
+    print(sub[[TARGET]].describe().loc[["count", "mean", "min", "max"]].round(4).to_string())
+    return sub
+
+
+# Exemple d'execution :
+# sub = executer(df, resultats, rapide=True)   # test rapide de bout en bout
+# sub = executer(df, resultats)                # version complete (lent)
