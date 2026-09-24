@@ -1,0 +1,613 @@
+
+import pickle
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import KFold
+
+
+# ============================================================================================
+# SECTION 1 — Imports et constantes
+# ============================================================================================
+TARGETS = ["DthAmt"]
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+# Clé de cohorte : mêmes assurés suivis d'une année à l'autre
+KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
+# 10 = T10+T20 et 11 = UL (3,4,5) n'existent que pour 2009-2011 -> groupes "grossiers" cohérents
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+# Colonnes CANDIDATES seulement — aucune n'est retenue d'office : voir SECTION 5.
+CANDIDATS = ["Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size", "IssueAge", "PolYear",
+            "AttdAge", "IssueYear", "YearStart", "log_qx_amt", "log_avg_size", "cv2", "log_expos",
+            "coh_ae_amt", "coh_log_E", "log_expec_amt"]  # >>> AJOUT : ExpecAmt (en log) comme candidate
+CANDIDATS_TEMPOREL = [c for c in CANDIDATS if c not in ("YearStart", "IssueYear")]  # extrapolation impossible
+
+SEUIL_GAIN = 0.0015       # gain relatif minimal de déviance pour garder une colonne (0.15 %) ; plus haut = liste plus courte
+PARAMS_GLM = dict(alpha=1e-4, max_iter=500)
+
+# >>> FIX 1 : force_row_wise=True (corrige le crash le plus fréquent lié à la construction d'histogrammes)
+# >>> FIX 2 : min_data_in_leaf 50 -> 100 (évite les feuilles trop petites/spécifiques)
+PARAMS_LGB = dict(learning_rate=0.05, num_leaves=31, min_data_in_leaf=100, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=1, lambda_l2=10.0, verbose=-1,
+                  force_row_wise=True)
+
+# Paramètres de repli utilisés automatiquement si le training LightGBM échoue (voir fit_lgb)
+PARAMS_LGB_SECOURS = dict(PARAMS_LGB, min_data_in_leaf=PARAMS_LGB["min_data_in_leaf"] * 2,
+                          bagging_fraction=1.0, bagging_freq=0, feature_fraction=1.0)
+
+
+# ============================================================================================
+# SECTION 2 — Métrique : déviance de Poisson (la métrique du défi pour le montant)
+# ============================================================================================
+def pdev(y, p):
+    """Déviance de Poisson moyenne. Plus petit = mieux."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+def _n(x, nd=0):
+    return f"{x:,.{nd}f}".replace(",", " ")
+
+
+# ============================================================================================
+# SECTION 3 — Préparation des variables
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009, 2223 -> 2022
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    d["IssueYear"] = d["YearStart"] - d["PolYear"]      # étiquette de cohorte d'émission
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)  # qx implicite de la table (montant)
+    d["log_qx_amt"] = np.log(d["qx_amt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2               # dispersion des montants (>= 1)
+    d["log_expos"] = np.log(e)
+    d["eff_n"] = a ** 2 / d["ExposAmt2"].clip(lower=1e-9)  # nb effectif de polices
+    # >>> AJOUT : ExpecAmt en log, comme CANDIDATE (pas comme offset en dur) — voir CANDIDATS ci-dessous.
+    # Testée par la sélection dynamique comme n'importe quelle autre colonne : elle n'est
+    # retenue que si elle apporte un vrai gain de déviance hors-pli, pas ajoutée en dur.
+    d["log_expec_amt"] = np.log(d["ExpecAmt"].clip(lower=1e-9))
+    return d
+
+
+def detect_mode(df, res):
+    return "interleaved" if res["Year"].isin(df["Year"]).mean() > 0.9 else "temporal"
+
+
+def make_folds(df, mode, n_splits, seed=42):
+    if mode == "interleaved":
+        return list(KFold(n_splits, shuffle=True, random_state=seed).split(df))
+    ys = np.sort(df["YearStart"].unique())[-3:]                   # validation sur les 3 dernières années
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+# ============================================================================================
+# SECTION 4 — Variables de cohorte (montant seulement)
+# ============================================================================================
+def cohort_table(src, k=1.0):
+    g = (src.groupby(KEY, sort=False).agg(DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum")).reset_index())
+    k_amt = k * src["ExpecAmt"].sum() / max(len(src), 1)
+    return g, k_amt
+
+
+def cohort_from_table(g, k_amt, dst, k=1.0):
+    m = dst[KEY].merge(g, on=KEY, how="left").fillna(0.0)
+    return pd.DataFrame({
+        "coh_ae_amt": ((m["DA"] + k_amt) / (m["EA"] + k_amt)).values,
+        "coh_log_E": np.log1p(m["EA"]).values}, index=dst.index)
+
+
+def cohort_apply(src, dst, k=1.0):
+    g, k_amt = cohort_table(src, k)
+    return cohort_from_table(g, k_amt, dst, k)
+
+
+def cohort_oof(src, n_splits=5, seed=0):
+    """Features de cohorte hors-pli (aucune fuite de la cible propre)."""
+    out = pd.DataFrame(index=src.index, columns=["coh_ae_amt", "coh_log_E"], dtype=float)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        out.iloc[va] = cohort_apply(src.iloc[tr], src.iloc[va]).values
+    return out
+
+
+# ============================================================================================
+# SECTION 5 — Sélection DYNAMIQUE des colonnes (forward selection, déviance hors-pli)
+#   Part d'aucune colonne (GLM = ExpecAmt seul), ajoute à chaque étape celle qui réduit le plus la
+#   déviance hors-pli, s'arrête quand le meilleur gain restant est sous SEUIL_GAIN. Rapide : le GLM
+#   sert d'éclaireur (le LightGBM final réutilisera l'ensemble retenu).
+# ============================================================================================
+def _glm_oof(d, cols, plis):
+    """Ratio prédit (DthAmt/ExpecAmt) hors-pli d'un GLM de Poisson sur `cols`."""
+    from sklearn.linear_model import PoissonRegressor
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    from sklearn.pipeline import Pipeline
+    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt", "log_expec_amt")]
+    cat = [c for c in cols if c not in num]
+    if not cols:
+        return np.ones(len(d))
+    blocs = []
+    if cat:
+        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
+    o = np.ones(len(d))
+    E = d["ExpecAmt"].to_numpy(float)
+    y = d["DthAmt"].to_numpy(float)
+    for tr, va in plis:
+        pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)),
+                         ("glm", PoissonRegressor(**PARAMS_GLM))])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pipe.fit(d.iloc[tr][cols], y[tr] / np.clip(E[tr], 1e-9, None), glm__sample_weight=E[tr])
+        o[va] = np.clip(pipe.predict(d.iloc[va][cols]), 1e-3, 1e2)
+    return o
+
+
+def selectionner_colonnes(df, mode=None, candidats=None, n_splits=3, seuil_gain=SEUIL_GAIN, verbose=True):
+    """
+    Sélection avant (forward selection) : ajoute une colonne à la fois, celle qui réduit le plus la
+    déviance de Poisson hors-pli, jusqu'à ce que le meilleur gain restant passe sous seuil_gain.
+    Renvoie (colonnes retenues, historique des étapes en DataFrame).
+    """
+    d = prep(df)
+    if mode is None:
+        mode = "interleaved"           # par défaut ; passe mode="temporal" si resultats couvre des années futures
+    if mode == "interleaved":
+        d = pd.concat([d, cohort_oof(d)], axis=1)
+    else:
+        d[["coh_ae_amt", "coh_log_E"]] = 1.0, 0.0     # neutres : pas de cohorte en extrapolation temporelle
+
+    candidats = list(candidats or (CANDIDATS if mode == "interleaved" else CANDIDATS_TEMPOREL))
+    candidats = [c for c in candidats if c in d.columns]
+    plis = make_folds(d, mode, n_splits)
+    y, E = d["DthAmt"].to_numpy(float), d["ExpecAmt"].to_numpy(float)
+    base_dev = pdev(y, E)
+
+    retenues, restantes, historique = [], list(candidats), []
+    dev_actuelle = base_dev
+    if verbose:
+        print(f"Sélection dynamique (mode {mode}, {n_splits} plis) | déviance de départ (ExpecAmt seul) = {_n(base_dev)}")
+    while restantes:
+        gains = {}
+        for c in restantes:
+            o = _glm_oof(d, retenues + [c], plis)
+            gains[c] = pdev(y, E * o)
+        meilleure = min(gains, key=gains.get)
+        gain_relatif = 1 - gains[meilleure] / dev_actuelle
+        historique.append({"Étape": len(historique) + 1, "Colonne testée": meilleure,
+                           "Déviance": gains[meilleure], "Gain relatif": gain_relatif,
+                           "Retenue": gain_relatif >= seuil_gain})
+        if gain_relatif < seuil_gain:
+            if verbose:
+                print(f"  arrêt : meilleur gain restant ({meilleure} : {gain_relatif:.2%}) < seuil ({seuil_gain:.2%})")
+            break
+        retenues.append(meilleure)
+        restantes.remove(meilleure)
+        dev_actuelle = gains[meilleure]
+        if verbose:
+            print(f"  + {meilleure:<14s} déviance = {_n(dev_actuelle):>14s}  (gain {gain_relatif:.2%}, total {_n(1 - dev_actuelle / base_dev, 4)[:6]})")
+    if verbose:
+        print(f"Colonnes retenues ({len(retenues)}) : {retenues}")
+    return retenues, pd.DataFrame(historique)
+
+
+# ============================================================================================
+# SECTION 6 — GLM (point de départ) et LightGBM (correction)
+# ============================================================================================
+def fit_glm(d, cols):
+    """GLM final, ajusté sur toutes les lignes de `d`, sur les colonnes retenues."""
+    from sklearn.linear_model import PoissonRegressor
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
+    from sklearn.pipeline import Pipeline
+    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
+                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt", "log_expec_amt")]
+    cat = [c for c in cols if c not in num]
+    blocs = []
+    if cat:
+        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
+    if num:
+        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
+    pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)), ("glm", PoissonRegressor(**PARAMS_GLM))])
+    E, y = d["ExpecAmt"].to_numpy(float), d["DthAmt"].to_numpy(float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pipe.fit(d[cols], y / np.clip(E, 1e-9, None), glm__sample_weight=E)
+    return pipe
+
+
+def glm_predict(pipe, d, cols):
+    return np.clip(pipe.predict(d[cols]), 1e-3, 1e2) if cols else np.ones(len(d))
+
+
+def _mapping(d, cols):
+    m = {}
+    for c in cols:
+        if not pd.api.types.is_numeric_dtype(d[c]):
+            m[c] = {v: i for i, v in enumerate(sorted(d[c].astype(str).unique()))}
+    return m
+
+
+def _X(d, cols, mapping):
+    X = d[cols].copy()
+    for c, mp in mapping.items():
+        X[c] = d[c].astype(str).map(mp).fillna(-1)
+    return X.astype(float)
+
+
+def fit_lgb(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
+    """
+    >>> FIX 5 : entraînement protégé. Si LightGBM plante (ex. "Check failed:
+    best_split_info.left_count > 0", souvent lié à des poids/feuilles dégénérés),
+    on retente UNE fois avec des paramètres plus prudents (PARAMS_LGB_SECOURS)
+    avant de faire remonter l'erreur avec un message clair.
+
+    >>> TWEEDIE : `objective` (et `tweedie_variance_power` le cas échéant) vient
+    maintenant de `params` lui-même plutôt que d'être forcé à "poisson" en dur —
+    ça permet d'utiliser la même fonction pour la correction Poisson (script d'origine)
+    et pour le modèle Tweedie direct (voir SECTION 6bis).
+    """
+    p = dict(params, seed=seed)
+    p.setdefault("objective", "poisson")
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    try:
+        return lgb.train(p, dtr, max_rounds, valid_sets=[dva],
+                         callbacks=[lgb.early_stopping(100, verbose=False)])
+    except lgb.basic.LightGBMError as err:
+        print(f"  [avertissement] LightGBM a échoué avec les paramètres normaux ({err}). "
+              f"Nouvelle tentative avec des paramètres plus prudents "
+              f"(min_data_in_leaf x2, bagging désactivé)...")
+        p2 = dict(PARAMS_LGB_SECOURS, seed=seed)
+        p2["objective"] = p["objective"]
+        if "tweedie_variance_power" in p:
+            p2["tweedie_variance_power"] = p["tweedie_variance_power"]
+        dtr2 = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+        dva2 = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr2)
+        try:
+            return lgb.train(p2, dtr2, max_rounds, valid_sets=[dva2],
+                             callbacks=[lgb.early_stopping(100, verbose=False)])
+        except lgb.basic.LightGBMError as err2:
+            raise RuntimeError(
+                "LightGBM a échoué deux fois de suite (paramètres normaux ET prudents). "
+                "Vérifie les statistiques de wtr/ztr affichées juste avant ce message "
+                "(valeurs extrêmes/NaN probables) ou réduis max_rounds / augmente "
+                "encore min_data_in_leaf."
+            ) from err2
+
+
+def rep(name, y, p):
+    print(f"  {name:<38s} devPoisson={pdev(y, p):>16,.0f}  somme_pred/somme_reel={p.sum() / y.sum():.4f}".replace(",", " "))
+
+
+# ============================================================================================
+# SECTION 6bis — TWEEDIE : modèle direct sur DthAmt (méthode 2 discutée)
+#   Au lieu de faire apprendre au LightGBM un RATIO (DthAmt / (ExpecAmt*ratio_GLM)) avec une
+#   perte de Poisson, on lui fait apprendre DthAmt DIRECTEMENT, avec offset = log(ExpecAmt x
+#   ratio_GLM) passé nativement en `init_score`, et une perte Tweedie. Tweedie est le cadre
+#   actuariel standard pour des montants (mélange fréquence Poisson + sévérité Gamma en un seul
+#   modèle cohérent) — plus adapté qu'un Poisson pur à la forme très asymétrique des montants.
+#   `tweedie_variance_power` (entre 1 et 2) contrôle le mélange : proche de 1 = quasi-Poisson,
+#   proche de 2 = quasi-Gamma. On le choisit empiriquement, PAS à la main, en minimisant la
+#   déviance de Poisson hors-pli (la métrique du concours) sur un balayage rapide.
+# ============================================================================================
+TWEEDIE_POWERS = (1.1, 1.3, 1.5, 1.7, 1.9)
+
+
+def choisir_tweedie_power(d, cols, mapping, plis, powers=TWEEDIE_POWERS, max_rounds=300, verbose=True):
+    """
+    Balayage rapide (peu de rounds, une seule seed) : pour chaque power candidat, entraîne un
+    LightGBM Tweedie sur chaque pli et mesure la déviance de Poisson hors-pli cumulée (le
+    critère du concours). Renvoie le power qui minimise cette déviance.
+    """
+    oof_par_power = {p: np.full(len(d), np.nan) for p in powers}
+    y_all = d["DthAmt"].to_numpy(float)
+    if verbose:
+        print(f"\nSélection de tweedie_variance_power parmi {powers} "
+              f"(balayage rapide, {max_rounds} rounds max, 1 seed)...")
+    for tr, va in plis:
+        d_tr, d_va = d.iloc[tr], d.iloc[va]
+        glm = fit_glm(d_tr, cols)
+        r_tr, r_va = glm_predict(glm, d_tr, cols), glm_predict(glm, d_va, cols)
+        Etr, Eva = d_tr["ExpecAmt"].to_numpy(float), d_va["ExpecAmt"].to_numpy(float)
+        ytr, yva = d_tr["DthAmt"].to_numpy(float), d_va["DthAmt"].to_numpy(float)
+        Xtr, Xva = _X(d_tr, cols, mapping), _X(d_va, cols, mapping)
+        otr = np.log(np.clip(Etr * r_tr, 1e-6, None))
+        ova = np.log(np.clip(Eva * r_va, 1e-6, None))
+        for power in powers:
+            params_p = dict(PARAMS_LGB, objective="tweedie", tweedie_variance_power=power)
+            b = fit_lgb(Xtr, ytr, otr, None, Xva, yva, ova, None, 0, max_rounds, params_p)
+            pred = np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration) + ova)
+            oof_par_power[power][va] = pred
+    scores = {}
+    for power, oof in oof_par_power.items():
+        cov = ~np.isnan(oof)
+        scores[power] = pdev(y_all[cov], oof[cov])
+        if verbose:
+            print(f"  tweedie_variance_power={power:.1f} -> devPoisson hors-pli = {_n(scores[power])}")
+    meilleur = min(scores, key=scores.get)
+    if verbose:
+        print(f"Power retenu : {meilleur} (devPoisson = {_n(scores[meilleur])})\n")
+    return meilleur
+
+
+# ============================================================================================
+# SECTION 7 — Contrôle des données, sauvegarde, chargement, prédiction sur resultats
+# ============================================================================================
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + TARGETS), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques".replace(",", " "))
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), (
+            f"{int(bad_r.sum())} lignes de resultats ont une valeur manquante/infinie dans {CRITIQUES} "
+            f"(exemple d'index : {list(resultats.index[bad_r][:5])}). Impossible de predire ces lignes.")
+    bad = _lignes_invalides(df, CRITIQUES + TARGETS)
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement.".replace(",", " "))
+        df = df.loc[~bad]
+    return df
+
+
+def save_bundle(bundle, path):
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def predict(bundle, resultats):
+    """
+    Prédit DthAmt pour `resultats`.
+    - objectif="poisson" (méthode d'origine) : ExpecAmt x ratio_GLM x correction_LightGBM.
+    - objectif="tweedie" (méthode 2) : le LightGBM prédit DthAmt directement, avec
+      ExpecAmt x ratio_GLM injecté comme offset (init_score) — mathématiquement le résultat
+      final suit la même forme "ExpecAmt x ratio" une fois qu'on repasse par l'exponentielle,
+      la différence est dans COMMENT le correctif est appris (perte Tweedie vs Poisson).
+    """
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+    if bundle["mode"] == "interleaved":
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res)], axis=1)
+    else:
+        res[["coh_ae_amt", "coh_log_E"]] = 1.0, 0.0
+    cols = bundle["colonnes"]
+    ratio = glm_predict(bundle["glm"], res, cols)
+    E = res["ExpecAmt"].clip(lower=1e-9).to_numpy(float)
+    X = _X(res, cols, bundle["mapping"]) if cols else pd.DataFrame(index=res.index)
+
+    if bundle.get("objectif", "poisson") == "tweedie":
+        off = np.log(np.clip(E * ratio, 1e-6, None))
+        amt = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off)
+                       for m in bundle["models_lgb"]], axis=0) * bundle["f_a"]
+    else:
+        off = np.log(E * ratio)
+        corr = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True))
+                        for m in bundle["models_lgb"]], axis=0)
+        amt = np.exp(off) * corr * bundle["f_a"]
+
+    sub = resultats.copy()
+    sub["DthAmt"] = np.clip(amt, 0, None)
+    return sub
+
+
+# ============================================================================================
+# SECTION 8 — Pipeline complet : run(df)
+# ============================================================================================
+def run(df, resultats=None, mode="auto", n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+        n_splits_selection=3, seuil_gain=SEUIL_GAIN, colonnes=None, params=None, verbose=True, save_path=None,
+        objectif="poisson", tweedie_power=None, tweedie_powers=TWEEDIE_POWERS):
+    """
+    1) sélectionne dynamiquement les colonnes (à moins que `colonnes` soit fourni explicitement)
+    2) entraîne le GLM (point de départ) puis le LightGBM (correction) sur df SEULEMENT
+    3) sauvegarde le modèle et prédit sur resultats
+
+    objectif : "poisson" (méthode d'origine, LightGBM corrige un RATIO) ou
+               "tweedie" (méthode 2 : LightGBM prédit DthAmt directement, offset natif,
+               perte Tweedie — plus adaptée à la forme asymétrique des montants).
+    tweedie_power : valeur fixe de tweedie_variance_power ; si None et objectif="tweedie",
+               elle est choisie automatiquement par `choisir_tweedie_power` (balayage rapide).
+    """
+    params = dict(PARAMS_LGB, **(params or {}))
+    assert objectif in ("poisson", "tweedie"), 'objectif doit être "poisson" ou "tweedie"'
+    miss = [c for c in REQUIRED + TARGETS if c not in df.columns]
+    if resultats is not None:
+        miss += [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = verifier_donnees(df, None, verbose=False)
+    if mode == "auto":
+        assert resultats is not None, 'Sans `resultats`, précise mode="interleaved" ou mode="temporal".'
+        mode = detect_mode(df, resultats)
+    if verbose:
+        print(f"Mode : {mode} | lignes df={len(df):,}\n".replace(",", " "))
+
+    d = prep(df).reset_index(drop=True)
+    if mode == "interleaved":
+        d = pd.concat([d, cohort_oof(d)], axis=1)
+    else:
+        d[["coh_ae_amt", "coh_log_E"]] = 1.0, 0.0
+
+    if colonnes is None:
+        cols, historique = selectionner_colonnes(df, mode, None, n_splits_selection, seuil_gain, verbose)
+    else:
+        cols, historique = list(colonnes), None
+        if verbose:
+            print(f"Colonnes fournies explicitement (pas de sélection dynamique) : {cols}")
+
+    plis = make_folds(d, mode, n_splits)
+    n = len(d)
+    oof = np.full(n, np.nan)
+    mapping = _mapping(d, cols)
+    models = []
+
+    # >>> TWEEDIE : choix du power AVANT la boucle principale, une seule fois, par balayage
+    # rapide (peu de rounds) — coûte quelques dizaines de secondes, pas le prix du run complet.
+    if objectif == "tweedie" and tweedie_power is None:
+        tweedie_power = choisir_tweedie_power(d, cols, mapping, plis, tweedie_powers, verbose=verbose)
+    elif objectif == "tweedie" and verbose:
+        print(f"tweedie_variance_power fixé manuellement à {tweedie_power} (pas de balayage).")
+
+    if verbose:
+        nom_methode = f"LightGBM Tweedie (power={tweedie_power})" if objectif == "tweedie" else "LightGBM Poisson (correction)"
+        print(f"\nEntraînement GLM + {nom_methode} ({n_splits} plis)...")
+    for k, (tr, va) in enumerate(plis):
+        d_tr, d_va = d.iloc[tr], d.iloc[va]
+        glm = fit_glm(d_tr, cols)
+        r_tr, r_va = glm_predict(glm, d_tr, cols), glm_predict(glm, d_va, cols)
+        Etr, Eva = d_tr["ExpecAmt"].to_numpy(float), d_va["ExpecAmt"].to_numpy(float)
+        ytr, yva = d_tr["DthAmt"].to_numpy(float), d_va["DthAmt"].to_numpy(float)
+        Xtr, Xva = _X(d_tr, cols, mapping), _X(d_va, cols, mapping)
+
+        if objectif == "tweedie":
+            # >>> TWEEDIE : cible = DthAmt BRUT, offset = log(ExpecAmt x ratio_GLM) passé
+            # nativement en init_score. Pas de division y/(E*r) ni de pondération par E*r —
+            # Tweedie gère lui-même la structure de variance fréquence+sévérité.
+            otr = np.log(np.clip(Etr * r_tr, 1e-6, None))
+            ova = np.log(np.clip(Eva * r_va, 1e-6, None))
+            ytr_lgb, yva_lgb = ytr, yva
+            wtr, wva = None, None
+            params_run = dict(params, objective="tweedie", tweedie_variance_power=tweedie_power)
+        else:
+            # >>> FIX 3 (méthode d'origine) : plancher du clip remonté de 1e-9 à 1e-6 pour
+            # éviter que ztr/zva explosent quand Etr*r_tr (ou Eva*r_va) est quasi nul.
+            ztr = ytr / np.clip(Etr * r_tr, 1e-6, None)
+            zva = yva / np.clip(Eva * r_va, 1e-6, None)
+            otr, ova = np.zeros(len(tr)), np.zeros(len(va))      # offset déjà dans le poids via ExpecAmt*ratio
+            ytr_lgb, yva_lgb = ztr, zva
+            wtr, wva = Etr * r_tr, Eva * r_va
+            params_run = params
+
+        # >>> FIX 4 : diagnostic avant l'entraînement — repère un pli à risque avant que
+        # LightGBM ne plante (valeurs extrêmes ou NaN dans les poids/cibles).
+        if verbose:
+            wtr_aff = wtr if wtr is not None else np.ones_like(ytr_lgb)
+            n_nan = int(np.isnan(wtr_aff).sum() + np.isnan(ytr_lgb).sum())
+            alerte = "  <-- À SURVEILLER" if (wtr_aff.max() / max(wtr_aff.min(), 1e-12) > 1e6 or n_nan > 0) else ""
+            print(f"    pli {k + 1}/{n_splits} diagnostic : "
+                  f"w[{wtr_aff.min():.3g}, {wtr_aff.max():.3g}]  cible[{ytr_lgb.min():.3g}, {ytr_lgb.max():.3g}]  "
+                  f"NaN={n_nan}{alerte}")
+
+        p_va = np.zeros(len(va))
+        for s in seeds:
+            b = fit_lgb(Xtr, ytr_lgb, otr, wtr, Xva, yva_lgb, ova, wva, s, max_rounds, params_run)
+            if objectif == "tweedie":
+                p_va += np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration) + ova) / len(seeds)
+            else:
+                p_va += Eva * r_va * np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration)) / len(seeds)
+            models.append(b.model_to_string(num_iteration=b.best_iteration))
+        oof[va] = p_va
+        if verbose:
+            print(f"  pli {k + 1}/{n_splits} : {b.best_iteration} arbres")
+
+    cov = ~np.isnan(oof)
+    y = d["DthAmt"].to_numpy(float)[cov]
+    if verbose:
+        print("\n== Montant (DthAmt) - validation hors-pli ==")
+        rep("Table de mortalité seule (ExpecAmt)", y, d["ExpecAmt"].to_numpy(float)[cov])
+        rep("GLM + LightGBM (colonnes dynamiques)", y, oof[cov])
+
+    f_a = float(y.sum() / oof[cov].sum())
+    if verbose:
+        print(f"\nFacteur de calibration globale : DthAmt x{f_a:.4f}")
+
+    glm_final = fit_glm(d, cols)
+    r_all = glm_predict(glm_final, d, cols)
+    X_all = _X(d, cols, mapping)
+    E_all = d["ExpecAmt"].to_numpy(float)
+    y_all = d["DthAmt"].to_numpy(float)
+    n_rounds = max(50, int(1.1 * np.mean([lgb.Booster(model_str=m).num_trees() for m in models]))) if models else 100
+
+    if objectif == "tweedie":
+        off_all = np.log(np.clip(E_all * r_all, 1e-6, None))
+        params_final = dict(params, objective="tweedie", tweedie_variance_power=tweedie_power)
+        b_final = fit_lgb(X_all, y_all, off_all, None, X_all, y_all, off_all, None,
+                          0, n_rounds, params_final)   # >>> protection FIX 5 réutilisée pour le modèle final
+    else:
+        z_all = y_all / np.clip(E_all * r_all, 1e-6, None)   # >>> FIX 3 (idem)
+        w_all = E_all * r_all
+        b_final = fit_lgb(X_all, z_all, np.zeros(len(d)), w_all, X_all, z_all, np.zeros(len(d)), w_all,
+                          0, n_rounds, params)   # >>> même protection FIX 5 réutilisée pour le modèle final
+
+    bundle = dict(mode=mode, colonnes=cols, mapping=mapping, glm=glm_final, models_lgb=[b_final.model_to_string()],
+                 f_a=f_a, historique_selection=historique, objectif=objectif, tweedie_power=tweedie_power)
+    if mode == "interleaved":
+        bundle["coh_g"], bundle["coh_k_amt"] = cohort_table(d)
+    if save_path:
+        save_bundle(bundle, save_path)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path}")
+
+    sub = predict(bundle, resultats) if resultats is not None else None
+    return dict(sub=sub, bundle=bundle, mode=mode, colonnes=cols, oof=oof, f_a=f_a, historique_selection=historique)
+
+
+# ============================================================================================
+# SECTION 9 — EXÉCUTION
+# ============================================================================================
+def executer(df, resultats, save_path="modele_glm_lgb_montant.pkl", out_csv="soumission_montant.csv",
+            rapide=False, objectif="poisson", tweedie_power=None):
+    """
+    1) contrôle les données et choisit le mode (lignes mélangées ou années futures)
+    2) sélectionne dynamiquement les colonnes pertinentes pour DthAmt (forward selection, déviance hors-pli)
+    3) entraîne GLM (point de départ) + LightGBM (correction, Poisson OU Tweedie) sur df SEULEMENT
+    4) prédit sur resultats, vérifie le résultat et écrit le CSV de soumission
+    rapide=True : sélection et entraînement allégés (test rapide).
+    objectif="tweedie" : méthode 2 — LightGBM prédit DthAmt directement (perte Tweedie),
+        au lieu de corriger un ratio avec une perte Poisson. Comparer les deux avec le
+        même df/resultats pour voir laquelle donne la meilleure déviance hors-pli.
+    Si ta variable s'appelle `résultats` (avec accent), appelle : executer(df, résultats)
+    """
+    df = verifier_donnees(df, resultats)
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    mode = "interleaved" if part > 0.9 else "temporal"
+    print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
+
+    kw = dict(n_splits=3, n_splits_selection=2, seeds=(0,), max_rounds=500, seuil_gain=0.003) if rapide else {}
+    out = run(df, mode=mode, save_path=save_path, objectif=objectif, tweedie_power=tweedie_power, **kw)
+
+    sub = predict(out["bundle"], resultats)
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[TARGETS].notna().all().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)".replace(",", " "))
+    print(sub[TARGETS].describe().loc[["count", "mean", "min", "max"]].round(4).to_string())
+    return sub
+
+
+# Exemple d'exécution (décommente la ligne voulue) :
+# sub = executer(df, resultats, rapide=True)   # test rapide
+# sub = executer(df, resultats)                # entraînement complet — mode corrigé
