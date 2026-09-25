@@ -1,0 +1,53 @@
+# -*- coding: utf-8 -*-
+"""
+Diagnostic de la deviance sur `resultats` quand on connait les vraies valeurs.
+Usage (notebook) :
+    diagnostic(sub, verite)
+    # sub    = sortie de executer(df, resultats)
+    # verite = resultats avec les VRAIES DthCnt / DthAmt, meme ordre de lignes
+"""
+import numpy as np
+import pandas as pd
+
+
+def dev_lignes(y, p):
+    """Deviance de Poisson ligne par ligne (meme formule que METRIC)."""
+    y = np.asarray(y, float)
+    p = np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return 2 * (t - (y - p))
+
+
+def diagnostic(sub, verite):
+    assert len(sub) == len(verite), "sub et verite n'ont pas le meme nombre de lignes"
+    for cible, base in (("DthCnt", "ExpecCnt"), ("DthAmt", "ExpecAmt")):
+        y = verite[cible].to_numpy(float)
+        p = sub[cible].to_numpy(float)
+        b = verite[base].to_numpy(float)
+        d_mod, d_ica = dev_lignes(y, p), dev_lignes(y, b)
+        z = y == 0
+
+        print(f"\n==================== {cible} ====================")
+        print(f"Lignes avec {cible}=0 : {z.mean():.1%}")
+        print(f"Deviance totale   modele = {d_mod.sum():,.0f}   |   baseline ICA = {d_ica.sum():,.0f}")
+        print(f"Gain vs ICA (D2)  = {1 - d_mod.sum() / d_ica.sum():+.2%}   (positif = le modele bat l'ICA)")
+        print(f"Part de la deviance venant des lignes y=0 : modele {d_mod[z].sum() / d_mod.sum():.1%}"
+              f" | ICA {d_ica[z].sum() / d_ica.sum():.1%}")
+        print(f"Somme pred / somme reel = {p.sum() / y.sum():.4f}   (ICA : {b.sum() / y.sum():.4f})")
+        if cible == "DthCnt":
+            print("Predictions 'quasi nulles' : " +
+                  " | ".join(f"< {s}: {(p < s).mean():.1%}" for s in (1e-3, 1e-2, 0.05, 0.1)))
+
+        # Test : que se passe-t-il si on force a 0 les petites predictions ?
+        print("Test 'forcer a 0' :")
+        for q in (0.5, 0.8, 0.9, 0.97):
+            s = np.quantile(p, q)
+            p0 = np.where(p < s, 0.0, p)
+            print(f"  pred < {s:.4g} (quantile {q:.0%}) -> 0  =>  deviance {dev_lignes(y, p0).sum():,.0f}")
+
+        t = pd.DataFrame({"y": y, "pred": p, "ica": b, "dev_mod": d_mod, "dev_ica": d_ica,
+                          "Size": verite["Size"].values})
+        print("\nTop 10 lignes qui pesent le plus dans la deviance du modele :")
+        print(t.nlargest(10, "dev_mod").round(3).to_string())
+        print("\nDeviance par tranche Size (modele vs ICA) :")
+        print(t.groupby("Size")[["dev_mod", "dev_ica"]].sum().round(0).to_string())
