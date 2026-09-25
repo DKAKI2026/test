@@ -1,0 +1,428 @@
+# -*- coding: utf-8 -*-
+"""
+Prédit DthAmt PRINCIPALEMENT à partir de ExpecAmt, avec LightGBM SEUL (pas de GLM) pour la
+correction cross-sectionnelle, ET gère explicitement les ANNÉES FUTURES (ex. Year=2324, 2425,
+2627 -> YearStart=2023, 2024, 2026), y compris au-delà de la dernière année vue en entraînement.
+
+DIFFÉRENCE avec la version précédente : plus d'étage GLM. LightGBM (perte Tweedie, offset
+log(ExpecAmt) natif) sert à la fois pour :
+  - la sélection dynamique des colonnes (forward selection, par déviance de Poisson hors-pli),
+  - la correction cross-sectionnelle finale.
+Plus simple, un seul type de modèle à maintenir/expliquer — au prix d'un peu moins
+d'interprétabilité directe que le GLM (coefficients linéaires clairs), compensable avec
+feature_importance() / SHAP sur LightGBM si besoin pour le jury.
+
+POURQUOI UN DESIGN SÉPARÉ POUR LE TEMPS ?
+  LightGBM ne sait pas EXTRAPOLER une tendance au-delà de la plage d'années vue en entraînement :
+  un split sur YearStart ne peut renvoyer qu'une valeur de feuille apprise sur des années passées
+  -> pour toute année future, la prédiction resterait "collée" à la dernière feuille connue.
+  SOLUTION (inchangée) : on sépare le problème en deux morceaux orthogonaux.
+    A) Un ratio CROSS-SECTIONNEL (Sex, Smoke, IssueAge, PolYear, Size, ...) -> LightGBM Tweedie,
+       SANS aucune colonne calendaire. Aucun problème d'extrapolation ici.
+    B) Une TENDANCE CALENDAIRE explicite (régression log-linéaire pondérée sur YearStart),
+       EXTRAPOLABLE par construction, avec AMORTISSEMENT (damping) au-delà de la dernière année
+       observée — pratique actuarielle standard pour les échelles d'amélioration de mortalité.
+
+PRÉDICTION FINALE :
+    DthAmt = ExpecAmt  x  ratio_cross-sectionnel(LightGBM Tweedie)  x  tendance_calendaire(YearStart)  x  f_a
+
+FICHIER UNIQUE — contenu
+  1. Imports et constantes                 5. Sélection dynamique des colonnes (LightGBM seul)
+  2. Métrique (déviance de Poisson)         6. LightGBM Tweedie (ratio cross-sectionnel)
+  3. Préparation des variables              7. Tendance calendaire (régression + amortissement)
+  4. Contrôle des données                   8. Pipeline complet run() / predict()   9. EXÉCUTION
+
+Utilisation :
+    sub = executer(df, resultats, rapide=True)   # test rapide
+    sub = executer(df, resultats)                # complet, gère les années futures automatiquement
+"""
+import pickle
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+
+# ============================================================================================
+# SECTION 1 — Imports et constantes
+# ============================================================================================
+TARGETS = ["DthAmt"]
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+# Colonnes CROSS-SECTIONNELLES candidates seulement — AUCUNE colonne calendaire (YearStart,
+# IssueYear) : gérées séparément par la tendance (SECTION 7), pas par LightGBM.
+CANDIDATS = ["Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size", "IssueAge", "PolYear",
+            "AttdAge", "log_qx_amt", "log_avg_size", "cv2", "log_expos", "log_expec_amt"]
+
+SEUIL_GAIN = 0.0015       # non utilisé (plus de sélection de colonnes) — conservé pour compatibilité
+PARAMS_LGB = dict(learning_rate=0.05, num_leaves=31, min_data_in_leaf=100, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=1, lambda_l2=10.0, verbose=-1,
+                  force_row_wise=True, metric="poisson")
+# >>> metric="poisson" : LightGBM utilise l'objectif "tweedie" (perte d'entraînement, mieux
+# adaptée à la forme asymétrique des montants), mais évalue chaque itération et décide de
+# l'early stopping avec la déviance de Poisson — la VRAIE métrique du concours (pdev() ailleurs
+# dans ce fichier). Sans ce réglage, LightGBM utiliserait par défaut la métrique Tweedie interne
+# pour l'early stopping, ce qui n'optimise pas exactement le bon critère.
+PARAMS_LGB_SECOURS = dict(PARAMS_LGB, min_data_in_leaf=PARAMS_LGB["min_data_in_leaf"] * 2,
+                          bagging_fraction=1.0, bagging_freq=0, feature_fraction=1.0)
+TWEEDIE_POWERS = (1.1, 1.3, 1.5, 1.7, 1.9)
+
+
+
+# ============================================================================================
+# SECTION 2 — Métrique
+# ============================================================================================
+def pdev(y, p):
+    """Déviance de Poisson moyenne. Plus petit = mieux."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+def _n(x, nd=0):
+    return f"{x:,.{nd}f}".replace(",", " ")
+
+
+# ============================================================================================
+# SECTION 3 — Préparation des variables
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009 ; 2324 -> 2023 ; 2627 -> 2026
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)
+    d["log_qx_amt"] = np.log(d["qx_amt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2
+    d["log_expos"] = np.log(e)
+    d["log_expec_amt"] = np.log(d["ExpecAmt"].clip(lower=1e-9))
+    return d
+
+
+def make_folds_temporel(df, n_val_years=3):
+    """
+    Plis de validation TEMPORELS : entraîne sur les années les plus anciennes, valide sur les
+    `n_val_years` années les plus récentes DE df -> imite honnêtement la vraie tâche.
+    """
+    ys = np.sort(df["YearStart"].unique())
+    ys_val = ys[-min(n_val_years, len(ys) - 1):]
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys_val]
+
+
+# ============================================================================================
+# SECTION 4 — Contrôle des données
+# ============================================================================================
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + TARGETS), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies".replace(",", " "))
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), f"{int(bad_r.sum())} lignes de resultats invalides dans {CRITIQUES}."
+    bad = _lignes_invalides(df, CRITIQUES + TARGETS)
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement.".replace(",", " "))
+        df = df.loc[~bad]
+    return df
+
+
+# ============================================================================================
+# SECTION 5 — LightGBM : mapping des catégorielles, entraînement protégé
+# ============================================================================================
+def _mapping(d, cols):
+    m = {}
+    for c in cols:
+        if not pd.api.types.is_numeric_dtype(d[c]):
+            m[c] = {v: i for i, v in enumerate(sorted(d[c].astype(str).unique()))}
+    return m
+
+
+def _X(d, cols, mapping):
+    if not cols:
+        return pd.DataFrame(index=d.index)
+    X = d[cols].copy()
+    for c, mp in mapping.items():
+        X[c] = d[c].astype(str).map(mp).fillna(-1)
+    return X.astype(float)
+
+
+def fit_lgb(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
+    """Entraînement protégé : repli automatique sur des paramètres prudents si LightGBM échoue."""
+    p = dict(params, seed=seed)
+    p.setdefault("objective", "tweedie")
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    try:
+        return lgb.train(p, dtr, max_rounds, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)])
+    except lgb.basic.LightGBMError as err:
+        print(f"  [avertissement] LightGBM a échoué ({err}). Nouvelle tentative, paramètres prudents...")
+        p2 = dict(PARAMS_LGB_SECOURS, seed=seed)
+        p2["objective"] = p["objective"]
+        if "tweedie_variance_power" in p:
+            p2["tweedie_variance_power"] = p["tweedie_variance_power"]
+        dtr2 = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+        dva2 = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr2)
+        return lgb.train(p2, dtr2, max_rounds, valid_sets=[dva2], callbacks=[lgb.early_stopping(100, verbose=False)])
+
+
+# ============================================================================================
+# SECTION 5bis — Colonnes CROSS-SECTIONNELLES : toutes les candidates, sans présélection
+#   Pas de forward selection ici : on donne TOUTES les colonnes de CANDIDATS à LightGBM et on le
+#   laisse décider lui-même lesquelles compter, via ses propres mécanismes (choix des splits par
+#   gain, feature_fraction, min_data_in_leaf, lambda_l2 — voir PARAMS_LGB). C'est plus simple et
+#   ça évite le biais du forward selection greedy (qui teste les colonnes une par une et peut
+#   rater une interaction utile entre deux colonnes individuellement faibles).
+#   Contrepartie à garder en tête : sans filtre externe, une colonne bruitée a plus de chances
+#   d'être utilisée ponctuellement par un arbre (voir la discussion précédente) — si tu veux
+#   objectiver l'apport de chaque colonne a posteriori, regarde `feature_importance()` du modèle
+#   final (voir predict()/bundle["models_lgb"]) plutôt que de la retirer a priori.
+# ============================================================================================# ============================================================================================
+
+# SECTION 6bis — choix précis de tweedie_variance_power, une fois les colonnes fixées
+# ============================================================================================
+def choisir_tweedie_power(d, cols, mapping, plis, powers=TWEEDIE_POWERS, max_rounds=300, verbose=True):
+    E = d["ExpecAmt"].to_numpy(float)
+    y = d["DthAmt"].to_numpy(float)
+    X_full = _X(d, cols, mapping)
+    off_full = np.log(np.clip(E, 1e-6, None))
+    oof_par_power = {p: np.full(len(d), np.nan) for p in powers}
+    if verbose:
+        print(f"\nSélection de tweedie_variance_power parmi {powers} (balayage rapide)...")
+    for tr, va in plis:
+        Xtr, Xva = X_full.iloc[tr], X_full.iloc[va]
+        ytr, yva = y[tr], y[va]
+        otr, ova = off_full[tr], off_full[va]
+        for power in powers:
+            params_p = dict(PARAMS_LGB, objective="tweedie", tweedie_variance_power=power)
+            b = fit_lgb(Xtr, ytr, otr, None, Xva, yva, ova, None, 0, max_rounds, params_p)
+            oof_par_power[power][va] = np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration) + ova)
+    scores = {p: pdev(y[~np.isnan(o)], o[~np.isnan(o)]) for p, o in oof_par_power.items()}
+    if verbose:
+        for p, s in scores.items():
+            print(f"  tweedie_variance_power={p:.1f} -> devPoisson hors-pli = {_n(s)}")
+    meilleur = min(scores, key=scores.get)
+    if verbose:
+        print(f"Power retenu : {meilleur}\n")
+    return meilleur
+
+
+# ============================================================================================
+# SECTION 7 — TENDANCE CALENDAIRE (extrapolable, avec amortissement pour les années futures)
+#   Régression log-linéaire PONDÉRÉE du résidu (DthAmt / (ExpecAmt x ratio_cross)) sur YearStart.
+#   -> capture une amélioration/détérioration systématique de la mortalité que ni la table
+#      (ExpecAmt) ni les colonnes cross-sectionnelles n'expliquent, EXTRAPOLABLE par construction
+#      (une droite se prolonge), avec AMORTISSEMENT au-delà de la dernière année observée
+#      (pratique actuarielle standard type échelle CMI, pour éviter qu'une tendance ne s'emballe).
+# ============================================================================================
+def estimer_tendance(d, ratio_cross_oof, verbose=True):
+    E = d["ExpecAmt"].to_numpy(float)
+    y = d["DthAmt"].to_numpy(float)
+    resid = np.clip(y / np.clip(E * ratio_cross_oof, 1e-6, None), 1e-3, 1e3)
+    log_resid = np.log(resid)
+    y_ref = int(d["YearStart"].max())
+    x = d["YearStart"].to_numpy(float) - y_ref
+    w = np.clip(E, 1e-9, None)
+
+    W = w.sum()
+    x_bar = np.sum(w * x) / W
+    y_bar = np.sum(w * log_resid) / W
+    b = np.sum(w * (x - x_bar) * (log_resid - y_bar)) / np.clip(np.sum(w * (x - x_bar) ** 2), 1e-12, None)
+    a = y_bar - b * x_bar
+
+    if verbose:
+        amelioration_pct = -(np.exp(b) - 1) * 100
+        print(f"Tendance calendaire estimée : {b:+.4f} en log par an "
+              f"(soit ~{amelioration_pct:+.2f}% de mortalité en moins par an, ancrée sur {y_ref})")
+    return dict(b=float(b), a=float(a), y_ref=y_ref)
+
+
+def facteur_tendance(year_start, tendance, damping=0.85, verbose_years=None):
+    """
+    Années <= y_ref : droite ajustée telle quelle. Années > y_ref (futures) : incréments annuels
+    amortis par `damping` (somme géométrique) -> la tendance ralentit au lieu de s'extrapoler
+    indéfiniment en ligne droite. Résultat bridé dans [0.5, 2.0] par sécurité.
+    """
+    b, y_ref = tendance["b"], tendance["y_ref"]
+    ys = np.atleast_1d(np.asarray(year_start, dtype=float))
+    log_f = np.empty_like(ys)
+    dans_plage = ys <= y_ref
+    log_f[dans_plage] = b * (ys[dans_plage] - y_ref)
+    if np.any(~dans_plage):
+        h = ys[~dans_plage] - y_ref
+        if damping >= 0.999:
+            log_f[~dans_plage] = b * h
+        else:
+            log_f[~dans_plage] = b * (1 - damping ** h) / (1 - damping)
+    f = np.clip(np.exp(log_f), 0.5, 2.0)
+    if verbose_years is not None:
+        for yv in sorted(set(int(v) for v in verbose_years)):
+            i = int(np.argmin(np.abs(ys - yv))) if ys.size > 1 else 0
+            print(f"  Year {yv} -> facteur de tendance = {f[i] if ys.size>1 else float(f):.4f}"
+                  f"  {'(extrapolé, amorti)' if yv > y_ref else '(dans l historique)'}")
+    return f if ys.size > 1 else float(f[0])
+
+
+# ============================================================================================
+# SECTION 8 — Pipeline complet
+# ============================================================================================
+def run(df, resultats=None, n_splits_power=2, colonnes=None,
+        n_splits=5, seeds=(0, 1, 2), max_rounds=3000, tweedie_power=None,
+        damping=0.85, params=None, verbose=True, save_path=None):
+    params = dict(PARAMS_LGB, **(params or {}))
+    miss = [c for c in REQUIRED + TARGETS if c not in df.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = verifier_donnees(df, resultats, verbose=verbose)
+    d = prep(df).reset_index(drop=True)
+    if verbose:
+        print(f"\nlignes df={len(d):,} | années d'entraînement : {int(d['YearStart'].min())}"
+              f"-{int(d['YearStart'].max())}\n".replace(",", " "))
+
+    # >>> Pas de sélection : toutes les colonnes candidates sont données telles quelles à
+    # LightGBM (sauf si `colonnes` est fourni explicitement) — c'est lui qui décide.
+    cols = list(colonnes) if colonnes is not None else [c for c in CANDIDATS if c in d.columns]
+    historique = None
+    if verbose:
+        print(f"Colonnes cross-sectionnelles utilisées ({len(cols)}, aucun filtrage) : {cols}")
+
+    plis_power = make_folds_temporel(d, n_val_years=n_splits_power)
+    plis = make_folds_temporel(d, n_val_years=n_splits)
+    mapping = _mapping(d, cols)
+
+    if tweedie_power is None:
+        tweedie_power = choisir_tweedie_power(d, cols, mapping, plis_power, verbose=verbose)
+
+    E_all, y_all = d["ExpecAmt"].to_numpy(float), d["DthAmt"].to_numpy(float)
+    X_all = _X(d, cols, mapping)
+    off_all = np.log(np.clip(E_all, 1e-6, None))
+    params_final = dict(params, objective="tweedie", tweedie_variance_power=tweedie_power)
+
+    if verbose:
+        print(f"Entraînement LightGBM Tweedie (power={tweedie_power}, {len(plis)} plis)...")
+    oof_cross = np.full(len(d), np.nan)
+    models = []
+    for k, (tr, va) in enumerate(plis):
+        Xtr, Xva = X_all.iloc[tr], X_all.iloc[va]
+        ytr, yva = y_all[tr], y_all[va]
+        otr, ova = off_all[tr], off_all[va]
+        p_va = np.zeros(len(va))
+        for s in seeds:
+            b = fit_lgb(Xtr, ytr, otr, None, Xva, yva, ova, None, s, max_rounds, params_final)
+            p_va += np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration)) / len(seeds)
+            models.append(b.model_to_string(num_iteration=b.best_iteration))
+        oof_cross[va] = p_va                # ratio cross-sectionnel (correction pure, sans l'offset E)
+        if verbose:
+            print(f"  pli {k + 1}/{len(plis)} (validation {int(d['YearStart'].iloc[va[0]])}) : {b.best_iteration} arbres")
+
+    cov = ~np.isnan(oof_cross)
+    tendance = estimer_tendance(d.loc[cov].reset_index(drop=True), oof_cross[cov], verbose=verbose)
+
+    trend_oof = facteur_tendance(d["YearStart"].to_numpy(float)[cov], tendance, damping=damping)
+    pred_oof = E_all[cov] * oof_cross[cov] * trend_oof
+    f_a = float(y_all[cov].sum() / pred_oof.sum())
+    if verbose:
+        print("\n== Validation hors-pli (dernières années de df) ==")
+        print(f"  Table seule (ExpecAmt)               devPoisson={pdev(y_all[cov], E_all[cov]):>14,.0f}".replace(",", " "))
+        print(f"  + cross-sectionnel (sans tendance)    devPoisson={pdev(y_all[cov], E_all[cov]*oof_cross[cov]):>14,.0f}".replace(",", " "))
+        print(f"  + cross-sectionnel + tendance          devPoisson={pdev(y_all[cov], pred_oof):>14,.0f}".replace(",", " "))
+        print(f"\nFacteur de calibration globale : DthAmt x{f_a:.4f}")
+
+    n_rounds = max(50, int(1.1 * np.mean([lgb.Booster(model_str=m).num_trees() for m in models]))) if models else 100
+    b_final = fit_lgb(X_all, y_all, off_all, None, X_all, y_all, off_all, None, 0, n_rounds, params_final)
+
+    bundle = dict(colonnes=cols, mapping=mapping, models_lgb=[b_final.model_to_string()],
+                 tendance=tendance, damping=damping, f_a=f_a, historique_selection=historique,
+                 tweedie_power=tweedie_power, annee_max_entrainement=int(d["YearStart"].max()))
+    if save_path:
+        with open(save_path, "wb") as f:
+            pickle.dump(bundle, f)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path}")
+
+    sub = predict(bundle, resultats, verbose=verbose) if resultats is not None else None
+    return dict(sub=sub, bundle=bundle, cols=cols, f_a=f_a, tendance=tendance, historique_selection=historique)
+
+
+def predict(bundle, resultats, verbose=True):
+    """
+    Prédit DthAmt = ExpecAmt x ratio_cross(LightGBM) x facteur_tendance(YearStart) x f_a.
+    Fonctionne pour N'IMPORTE QUELLE année, y compris jamais vue en entraînement (ex. 2324,
+    2425, 2627) : le ratio cross-sectionnel ne dépend pas du calendrier, et le facteur de
+    tendance est une droite amortie au-delà de la dernière année d'entraînement.
+    """
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+    cols = bundle["colonnes"]
+    X = _X(res, cols, bundle["mapping"])
+    ratio_cross = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True))
+                           for m in bundle["models_lgb"]], axis=0)
+
+    annees_futures = sorted(set(res.loc[res["YearStart"] > bundle["annee_max_entrainement"], "YearStart"].astype(int)))
+    if verbose and annees_futures:
+        print(f"\nAnnées au-delà de l'entraînement (extrapolées, tendance amortie avec "
+              f"damping={bundle['damping']}) : {annees_futures}")
+        facteur_tendance(np.array(annees_futures, dtype=float), bundle["tendance"],
+                         damping=bundle["damping"], verbose_years=annees_futures)
+
+    trend = facteur_tendance(res["YearStart"].to_numpy(float), bundle["tendance"], damping=bundle["damping"])
+    amt = res["ExpecAmt"].clip(lower=1e-9).to_numpy(float) * ratio_cross * trend * bundle["f_a"]
+
+    sub = resultats.copy()
+    sub["DthAmt"] = np.clip(amt, 0, None)
+    return sub
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ============================================================================================
+# SECTION 9 — EXÉCUTION
+# ============================================================================================
+def executer(df, resultats, save_path="modele_lgb_seul_tendance.pkl", out_csv="soumission.csv",
+            rapide=False, damping=0.85):
+    """
+    rapide=True : sélection et entraînement allégés (test rapide).
+    damping : amortissement de la tendance pour les années au-delà de l'entraînement
+              (0.85 par défaut ; 1.0 = extrapolation linéaire pure).
+    """
+    kw = dict(n_splits=3, n_splits_power=1, seeds=(0,), max_rounds=500) if rapide else {}
+    out = run(df, resultats, save_path=save_path, damping=damping, **kw)
+    sub = out["sub"]
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[TARGETS].notna().all().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)".replace(",", " "))
+    print(sub[TARGETS].describe().loc[["count", "mean", "min", "max"]].round(4).to_string())
+    return sub
+
+
+# Exemple d'exécution :
+# sub = executer(df, resultats, rapide=True)     # test rapide
+# sub = executer(df, resultats)                  # complet — gère 2324/2425/2627 automatiquement
+# sub = executer(df, resultats, damping=1.0)      # extrapolation linéaire pure, sans amortissement
