@@ -1,0 +1,450 @@
+# -*- coding: utf-8 -*-
+"""
+Prédit DthAmt en DEUX ÉTAGES séparés (fréquence x sévérité), pour que le montant prédit soit
+NATURELLEMENT proche de 0 quand le nombre de décès attendu (DthCnt) l'est aussi — ce qu'un
+modèle unique sur DthAmt ne garantit pas (il peut prédire une petite valeur "moyenne" même sur
+une cellule quasi sans risque, sans lien explicite avec la fréquence réelle).
+
+DthAmt = DthCnt_prédit  x  Sévérité_prédite (montant moyen PAR décès)
+
+  A) FRÉQUENCE : DthCnt, offset=log(ExpecCnt), LightGBM Poisson (comptage -> Poisson est le bon
+     cadre ici, pas Tweedie). + tendance calendaire extrapolable (mortalité qui s'améliore
+     d'année en année) — voir la discussion précédente sur les années futures.
+  B) SÉVÉRITÉ : DthAmt / DthCnt (le montant moyen PAR décès, calculé UNIQUEMENT sur les lignes
+     où un décès a eu lieu, pondéré par DthCnt), offset=log(taille moyenne de police), LightGBM
+     Gamma (cible continue positive et asymétrique -> Gamma est le cadre standard pour une
+     sévérité, pas Poisson).
+  Les deux étages utilisent les MÊMES colonnes cross-sectionnelles candidates (toutes, sans
+  présélection — LightGBM décide lui-même), + la tendance calendaire pour la fréquence.
+
+POURQUOI ÇA RÈGLE LE "MONTANTS PRESQUE 0 QUAND DthCnt=0" :
+  Avant : un seul modèle apprend directement DthAmt -> rien ne le force à prédire un montant
+  proche de 0 sur les cellules à très faible fréquence, il peut juste apprendre une moyenne.
+  Maintenant : le montant prédit est un PRODUIT. Si ExpecCnt (donc DthCnt_prédit) est très
+  petit pour une cellule, le produit DthCnt_prédit x Sévérité_prédite l'est MÉCANIQUEMENT
+  aussi, peu importe la sévérité — la structure du modèle impose cette relation, elle n'a
+  plus besoin d'être "apprise" indirectement.
+
+FICHIER UNIQUE — contenu
+  1. Imports et constantes                 5. Étage A : FRÉQUENCE (LightGBM Poisson + tendance)
+  2. Métrique (déviance de Poisson)         6. Étage B : SÉVÉRITÉ (LightGBM Gamma)
+  3. Préparation des variables              7. Tendance calendaire (réutilisée pour la fréquence)
+  4. Contrôle des données                   8. Pipeline complet run() / predict()   9. EXÉCUTION
+
+Utilisation :
+    sub = executer(df, resultats, rapide=True)   # test rapide
+    sub = executer(df, resultats)                # complet, gère les années futures automatiquement
+"""
+import pickle
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+
+# ============================================================================================
+# SECTION 1 — Imports et constantes
+# ============================================================================================
+TARGETS = ["DthCnt", "DthAmt"]
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+# Colonnes CROSS-SECTIONNELLES candidates, sans colonne calendaire (gérée par la tendance) —
+# toutes données à LightGBM sans présélection, comme demandé.
+CANDIDATS = ["Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size", "IssueAge", "PolYear",
+            "AttdAge", "log_qx_amt", "log_avg_size", "cv2", "log_expos", "log_expec_amt"]
+
+PARAMS_LGB = dict(learning_rate=0.05, num_leaves=31, min_data_in_leaf=100, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=1, lambda_l2=10.0, verbose=-1,
+                  force_row_wise=True)
+PARAMS_LGB_SECOURS = dict(PARAMS_LGB, min_data_in_leaf=PARAMS_LGB["min_data_in_leaf"] * 2,
+                          bagging_fraction=1.0, bagging_freq=0, feature_fraction=1.0)
+
+
+# ============================================================================================
+# SECTION 2 — Métrique
+# ============================================================================================
+def pdev(y, p):
+    """Déviance de Poisson moyenne (métrique du concours). Plus petit = mieux."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+def _n(x, nd=0):
+    return f"{x:,.{nd}f}".replace(",", " ")
+
+
+# ============================================================================================
+# SECTION 3 — Préparation des variables
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009 ; 2324 -> 2023 ; 2627 -> 2026
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)
+    d["log_qx_amt"] = np.log(d["qx_amt"])
+    d["log_avg_size"] = np.log(a / e)                    # taille moyenne de police (garder comme feature candidate)
+    # >>> AJOUT : sévérité implicite de la TABLE (ExpecAmt / ExpecCnt) = le montant moyen par
+    # décès selon la table en vigueur -> offset naturel de l'étage sévérité, qui réintroduit
+    # ExpecAmt comme socle explicite de toute la prédiction finale (voir SECTION 7bis).
+    ec = d["ExpecCnt"].clip(lower=1e-6)
+    d["sev_table"] = (d["ExpecAmt"].clip(lower=1e-9) / ec)
+    d["log_sev_table"] = np.log(d["sev_table"].clip(lower=1e-9))
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2
+    d["log_expos"] = np.log(e)
+    d["log_expec_amt"] = np.log(d["ExpecAmt"].clip(lower=1e-9))
+    return d
+
+
+def make_folds_temporel(df, n_val_years=3):
+    ys = np.sort(df["YearStart"].unique())
+    ys_val = ys[-min(n_val_years, len(ys) - 1):]
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys_val]
+
+
+# ============================================================================================
+# SECTION 4 — Contrôle des données
+#   >>> DthCnt=0 / DthAmt=0 sont des VRAIES valeurs (0 décès observé), jamais retirées.
+#   Seules les colonnes critiques (exposition, âge...) invalident une ligne si NaN — on ne peut
+#   pas inventer une exposition manquante. Un NaN résiduel dans les cibles (s'il y en a, séparé
+#   du cas "0 littéral" que tu as clarifié) est traité comme 0 par sécurité, sans jamais retirer
+#   la ligne.
+# ============================================================================================
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies".replace(",", " "))
+        for t in TARGETS:
+            n_nan = int(pd.to_numeric(df[t], errors="coerce").isna().sum())
+            if n_nan:
+                rows.append(f"  df         {t:<12s} {n_nan:>10,} NaN -> traités comme 0 (PAS retirés)".replace(",", " "))
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), f"{int(bad_r.sum())} lignes de resultats invalides dans {CRITIQUES}."
+
+    bad = _lignes_invalides(df, CRITIQUES)
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees (colonne critique invalide, hors cibles).".replace(",", " "))
+        df = df.loc[~bad]
+
+    df = df.copy()
+    for t in TARGETS:
+        df[t] = pd.to_numeric(df[t], errors="coerce").fillna(0.0)
+    return df
+
+
+# ============================================================================================
+# SECTION 5 — Outils LightGBM communs (mapping, entraînement protégé)
+# ============================================================================================
+def _mapping(d, cols):
+    m = {}
+    for c in cols:
+        if not pd.api.types.is_numeric_dtype(d[c]):
+            m[c] = {v: i for i, v in enumerate(sorted(d[c].astype(str).unique()))}
+    return m
+
+
+def _X(d, cols, mapping):
+    if not cols:
+        return pd.DataFrame(index=d.index)
+    X = d[cols].copy()
+    for c, mp in mapping.items():
+        X[c] = d[c].astype(str).map(mp).fillna(-1)
+    return X.astype(float)
+
+
+def fit_lgb(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
+    """Entraînement protégé : repli automatique sur des paramètres prudents si LightGBM échoue."""
+    p = dict(params, seed=seed)
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    try:
+        return lgb.train(p, dtr, max_rounds, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)])
+    except lgb.basic.LightGBMError as err:
+        print(f"  [avertissement] LightGBM a échoué ({err}). Nouvelle tentative, paramètres prudents...")
+        p2 = dict(PARAMS_LGB_SECOURS, seed=seed, objective=p["objective"])
+        dtr2 = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+        dva2 = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr2)
+        return lgb.train(p2, dtr2, max_rounds, valid_sets=[dva2], callbacks=[lgb.early_stopping(100, verbose=False)])
+
+
+# ============================================================================================
+# SECTION 6 — TENDANCE CALENDAIRE (extrapolable, réutilisée pour la FRÉQUENCE)
+#   Amélioration/détérioration de mortalité = un phénomène de FRÉQUENCE avant tout. On l'estime
+#   sur le résidu de fréquence hors-pli, extrapolable (droite), amortie pour les années futures
+#   (pratique actuarielle standard type échelle CMI).
+# ============================================================================================
+def estimer_tendance(d, ratio_oof, cible, verbose=True, nom="fréquence"):
+    E = d[cible].to_numpy(float)   # ExpecCnt pour la fréquence
+    y = d["DthCnt"].to_numpy(float) if cible == "ExpecCnt" else d["DthAmt"].to_numpy(float)
+    resid = np.clip(y / np.clip(E * ratio_oof, 1e-6, None), 1e-3, 1e3)
+    log_resid = np.log(resid)
+    y_ref = int(d["YearStart"].max())
+    x = d["YearStart"].to_numpy(float) - y_ref
+    w = np.clip(E, 1e-9, None)
+
+    W = w.sum()
+    x_bar = np.sum(w * x) / W
+    y_bar = np.sum(w * log_resid) / W
+    b = np.sum(w * (x - x_bar) * (log_resid - y_bar)) / np.clip(np.sum(w * (x - x_bar) ** 2), 1e-12, None)
+    a = y_bar - b * x_bar
+
+    if verbose:
+        pct = -(np.exp(b) - 1) * 100
+        print(f"Tendance calendaire ({nom}) : {b:+.4f} en log/an (~{pct:+.2f}%/an), ancrée sur {y_ref}")
+    return dict(b=float(b), a=float(a), y_ref=y_ref)
+
+
+def facteur_tendance(year_start, tendance, damping=0.85, verbose_years=None):
+    b, y_ref = tendance["b"], tendance["y_ref"]
+    ys = np.atleast_1d(np.asarray(year_start, dtype=float))
+    log_f = np.empty_like(ys)
+    dans_plage = ys <= y_ref
+    log_f[dans_plage] = b * (ys[dans_plage] - y_ref)
+    if np.any(~dans_plage):
+        h = ys[~dans_plage] - y_ref
+        log_f[~dans_plage] = b * h if damping >= 0.999 else b * (1 - damping ** h) / (1 - damping)
+    f = np.clip(np.exp(log_f), 0.5, 2.0)
+    if verbose_years is not None:
+        for yv in sorted(set(int(v) for v in verbose_years)):
+            i = int(np.argmin(np.abs(ys - yv))) if ys.size > 1 else 0
+            print(f"  Year {yv} -> facteur de tendance = {f[i] if ys.size>1 else float(f):.4f}"
+                  f"  {'(extrapolé, amorti)' if yv > y_ref else '(dans l historique)'}")
+    return f if ys.size > 1 else float(f[0])
+
+
+# ============================================================================================
+# SECTION 7 — Pipeline complet : fréquence puis sévérité
+# ============================================================================================
+def run(df, resultats=None, colonnes=None, n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+        damping=0.85, params=None, verbose=True, save_path=None):
+    params = dict(PARAMS_LGB, **(params or {}))
+    miss = [c for c in REQUIRED + TARGETS if c not in df.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = verifier_donnees(df, resultats, verbose=verbose)
+    d = prep(df).reset_index(drop=True)
+    if verbose:
+        print(f"\nlignes df={len(d):,} | années : {int(d['YearStart'].min())}-{int(d['YearStart'].max())}"
+              f" | lignes avec >=1 décès : {(d['DthCnt']>0).sum():,} ({(d['DthCnt']>0).mean():.1%})\n".replace(",", " "))
+
+    cols = list(colonnes) if colonnes is not None else [c for c in CANDIDATS if c in d.columns]
+    if verbose:
+        print(f"Colonnes cross-sectionnelles utilisées ({len(cols)}, aucun filtrage) : {cols}")
+
+    plis = make_folds_temporel(d, n_val_years=n_splits)
+    mapping = _mapping(d, cols)
+    X_all = _X(d, cols, mapping)
+
+    # ---------------------------------------------------------------------------------
+    # ÉTAGE A — FRÉQUENCE (DthCnt), Poisson, offset=log(ExpecCnt)
+    # ---------------------------------------------------------------------------------
+    Ec_all = d["ExpecCnt"].to_numpy(float)
+    c_all = d["DthCnt"].to_numpy(float)
+    off_c_all = np.log(np.clip(Ec_all, 1e-6, None))
+    params_freq = dict(params, objective="poisson", metric="poisson")
+
+    if verbose:
+        print(f"\n--- Étage A : FRÉQUENCE (LightGBM Poisson, {len(plis)} plis) ---")
+    oof_freq = np.full(len(d), np.nan)
+    models_freq = []
+    for k, (tr, va) in enumerate(plis):
+        Xtr, Xva = X_all.iloc[tr], X_all.iloc[va]
+        ctr, cva = c_all[tr], c_all[va]
+        otr, ova = off_c_all[tr], off_c_all[va]
+        p_va = np.zeros(len(va))
+        for s in seeds:
+            b = fit_lgb(Xtr, ctr, otr, None, Xva, cva, ova, None, s, max_rounds, params_freq)
+            p_va += np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration)) / len(seeds)
+            models_freq.append(b.model_to_string(num_iteration=b.best_iteration))
+        oof_freq[va] = p_va
+        if verbose:
+            print(f"  pli {k+1}/{len(plis)} (validation {int(d['YearStart'].iloc[va[0]])}) : {b.best_iteration} arbres")
+
+    cov = ~np.isnan(oof_freq)
+    tendance_freq = estimer_tendance(d.loc[cov].reset_index(drop=True), oof_freq[cov], "ExpecCnt", verbose=verbose)
+    trend_freq_oof = facteur_tendance(d["YearStart"].to_numpy(float)[cov], tendance_freq, damping=damping)
+    pred_cnt_oof = Ec_all[cov] * oof_freq[cov] * trend_freq_oof
+    f_c = float(c_all[cov].sum() / pred_cnt_oof.sum())
+    if verbose:
+        print(f"Facteur de calibration fréquence : DthCnt x{f_c:.4f}")
+        print(f"  devPoisson(DthCnt) : ExpecCnt seul={pdev(c_all[cov], Ec_all[cov]):,.0f} -> "
+              f"modèle+tendance={pdev(c_all[cov], pred_cnt_oof*f_c):,.0f}".replace(",", " "))
+
+    n_rounds_c = max(50, int(1.1 * np.mean([lgb.Booster(model_str=m).num_trees() for m in models_freq]))) if models_freq else 100
+    b_freq_final = fit_lgb(X_all, c_all, off_c_all, None, X_all, c_all, off_c_all, None, 0, n_rounds_c, params_freq)
+
+    # ---------------------------------------------------------------------------------
+    # ÉTAGE B — SÉVÉRITÉ (DthAmt / DthCnt), Gamma, offset=log(taille moyenne de police)
+    #   UNIQUEMENT sur les lignes où un décès a eu lieu (DthCnt>0) — pas de "sévérité" à
+    #   observer là où il n'y a pas eu de décès. Pondéré par DthCnt (une ligne à 5 décès
+    #   informe plus sur la sévérité moyenne qu'une ligne à 1 décès).
+    # ---------------------------------------------------------------------------------
+    a_tous = d["DthAmt"].to_numpy(float)
+    masque_sev = d["DthCnt"].to_numpy(float) > 0
+    d_sev = d.loc[masque_sev].reset_index(drop=True)
+    sev_y = (a_tous[masque_sev] / c_all[masque_sev])           # montant moyen PAR décès
+    sev_w = c_all[masque_sev]                                   # poids = nb de décès dans la ligne
+    off_sev = d_sev["log_sev_table"].to_numpy(float)             # >>> ExpecAmt/ExpecCnt = offset naturel
+    X_sev = _X(d_sev, cols, mapping)
+    plis_sev = make_folds_temporel(d_sev, n_val_years=n_splits)
+    params_sev = dict(params, objective="gamma")
+
+    if verbose:
+        print(f"\n--- Étage B : SÉVÉRITÉ (LightGBM Gamma, {masque_sev.sum():,} lignes avec décès, "
+              f"{len(plis_sev)} plis) ---".replace(",", " "))
+    oof_sev = np.full(len(d_sev), np.nan)
+    models_sev = []
+    for k, (tr, va) in enumerate(plis_sev):
+        Xtr, Xva = X_sev.iloc[tr], X_sev.iloc[va]
+        ytr, yva = sev_y[tr], sev_y[va]
+        wtr, wva = sev_w[tr], sev_w[va]
+        otr, ova = off_sev[tr], off_sev[va]
+        p_va = np.zeros(len(va))
+        for s in seeds:
+            b = fit_lgb(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, s, max_rounds, params_sev)
+            p_va += np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration)) / len(seeds)
+            models_sev.append(b.model_to_string(num_iteration=b.best_iteration))
+        oof_sev[va] = p_va
+        if verbose:
+            print(f"  pli {k+1}/{len(plis_sev)} : {b.best_iteration} arbres")
+
+    cov_sev = ~np.isnan(oof_sev)
+    pred_sev_oof = np.exp(off_sev[cov_sev]) * oof_sev[cov_sev]
+    f_s = float(np.sum(sev_y[cov_sev] * sev_w[cov_sev]) / np.sum(pred_sev_oof * sev_w[cov_sev]))
+    if verbose:
+        print(f"Facteur de calibration sévérité : x{f_s:.4f}")
+
+    n_rounds_s = max(50, int(1.1 * np.mean([lgb.Booster(model_str=m).num_trees() for m in models_sev]))) if models_sev else 100
+    b_sev_final = fit_lgb(X_sev, sev_y, off_sev, sev_w, X_sev, sev_y, off_sev, sev_w, 0, n_rounds_s, params_sev)
+
+    # ---------------------------------------------------------------------------------
+    # Validation hors-pli COMBINÉE : DthAmt = DthCnt_pred x Sévérité_pred.
+    # La fréquence est bien HORS-PLI (oof_freq, jamais vue en entraînement pour ces lignes).
+    # La sévérité utilise ici le modèle FINAL (par segment, pas une moyenne globale) — ce
+    # n'est pas strictement hors-pli sur cet étage précis, mais c'est fidèle à ce que
+    # predict() fait réellement en production (un seul modèle final pour les deux étages) et
+    # bien plus informatif qu'une sévérité moyenne globale plate.
+    # ---------------------------------------------------------------------------------
+    off_sev_all = d["log_sev_table"].to_numpy(float)
+    ratio_sev_all = np.exp(b_sev_final.predict(X_all, raw_score=True))
+    sev_pred_all = np.exp(off_sev_all) * ratio_sev_all * f_s
+    amt_pred_oof = np.full(len(d), np.nan)
+    amt_pred_oof[cov] = pred_cnt_oof * f_c * sev_pred_all[cov]
+    cov_amt = ~np.isnan(amt_pred_oof)
+    if verbose:
+        print("\n== Validation hors-pli combinée (fréquence HORS-PLI x sévérité par segment) ==")
+        print(f"  Table seule (ExpecAmt)     devPoisson={pdev(a_tous[cov_amt], d['ExpecAmt'].to_numpy(float)[cov_amt]):>14,.0f}".replace(",", " "))
+        print(f"  Fréquence x Sévérité       devPoisson={pdev(a_tous[cov_amt], amt_pred_oof[cov_amt]):>14,.0f}".replace(",", " "))
+
+    bundle = dict(colonnes=cols, mapping=mapping, models_freq=[b_freq_final.model_to_string()],
+                 models_sev=[b_sev_final.model_to_string()], tendance_freq=tendance_freq, damping=damping,
+                 f_c=f_c, f_s=f_s, annee_max_entrainement=int(d["YearStart"].max()))
+    if save_path:
+        with open(save_path, "wb") as f:
+            pickle.dump(bundle, f)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path}")
+
+    sub = predict(bundle, resultats, verbose=verbose) if resultats is not None else None
+    return dict(sub=sub, bundle=bundle, cols=cols, f_c=f_c, f_s=f_s, tendance_freq=tendance_freq)
+
+
+def predict(bundle, resultats, verbose=True):
+    """
+    DthAmt = DthCnt_prédit x Sévérité_prédite.
+    DthCnt_prédit = ExpecCnt x ratio_fréquence(LightGBM Poisson) x tendance(YearStart) x f_c.
+    Sévérité_prédite = taille_moyenne_police x ratio_sévérité(LightGBM Gamma) x f_s.
+    Fonctionne pour des années jamais vues (extrapolation de la tendance, amortie).
+    """
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+    cols = bundle["colonnes"]
+    X = _X(res, cols, bundle["mapping"])
+
+    ratio_freq = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True)) for m in bundle["models_freq"]], axis=0)
+    ratio_sev = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True)) for m in bundle["models_sev"]], axis=0)
+
+    annees_futures = sorted(set(res.loc[res["YearStart"] > bundle["annee_max_entrainement"], "YearStart"].astype(int)))
+    if verbose and annees_futures:
+        print(f"\nAnnées au-delà de l'entraînement (extrapolées, damping={bundle['damping']}) : {annees_futures}")
+        facteur_tendance(np.array(annees_futures, dtype=float), bundle["tendance_freq"],
+                         damping=bundle["damping"], verbose_years=annees_futures)
+
+    trend = facteur_tendance(res["YearStart"].to_numpy(float), bundle["tendance_freq"], damping=bundle["damping"])
+    dthcnt_pred = res["ExpecCnt"].clip(lower=0).to_numpy(float) * ratio_freq * trend * bundle["f_c"]
+    severite_pred = res["log_sev_table"].to_numpy(float)   # >>> ExpecAmt/ExpecCnt, cohérent avec l'entraînement
+    severite_pred = np.exp(severite_pred) * ratio_sev * bundle["f_s"]
+
+    amt = np.clip(dthcnt_pred, 0, None) * severite_pred
+    sub = resultats.copy()
+    sub["DthCnt"] = np.clip(dthcnt_pred, 0, None)
+    sub["DthAmt"] = np.clip(amt, 0, None)
+    return sub
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def diagnostiquer_predictions(df_verite, predictions, verbose=True):
+    """Répartit la déviance de Poisson entre lignes vrai=0 et vrai>0 (voir discussion précédente)."""
+    y = pd.to_numeric(df_verite["DthAmt"], errors="coerce").fillna(0.0).to_numpy(float)
+    p = np.asarray(predictions, dtype=float)
+    est_zero = (y == 0)
+    contrib_zero = float(np.sum(2 * p[est_zero])) if est_zero.any() else 0.0
+    y_pos, p_pos = y[~est_zero], p[~est_zero]
+    contrib_pos = float(np.sum(2 * (y_pos * np.log(np.clip(y_pos, 1e-12, None) / np.clip(p_pos, 1e-12, None)) - (y_pos - p_pos)))) if (~est_zero).any() else 0.0
+    part_zero = contrib_zero / max(contrib_zero + contrib_pos, 1e-9)
+    if verbose:
+        print(f"Lignes vrai=0 : {est_zero.sum():,} ({est_zero.mean():.1%}) | prédiction moyenne={p[est_zero].mean():.2f}".replace(",", " "))
+        print(f"Lignes vrai>0 : {(~est_zero).sum():,} ({(~est_zero).mean():.1%}) | prédiction moyenne={p[~est_zero].mean():.2f}".replace(",", " "))
+        print(f"-> {part_zero:.1%} de la déviance vient des lignes vrai=0, {1-part_zero:.1%} des lignes vrai>0")
+    return dict(contrib_zero=contrib_zero, contrib_pos=contrib_pos, part_zero_pct=part_zero)
+
+
+# ============================================================================================
+# SECTION 9 — EXÉCUTION
+# ============================================================================================
+def executer(df, resultats, save_path="modele_freq_severite.pkl", out_csv="soumission.csv",
+            rapide=False, damping=0.85):
+    kw = dict(n_splits=3, seeds=(0,), max_rounds=500) if rapide else {}
+    out = run(df, resultats, save_path=save_path, damping=damping, **kw)
+    sub = out["sub"]
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[["DthAmt"]].notna().all().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)".replace(",", " "))
+    print(sub[["DthCnt", "DthAmt"]].describe().loc[["count", "mean", "min", "max"]].round(4).to_string())
+    return sub
+
+
+# Exemple d'exécution :
+# sub = executer(df, resultats, rapide=True)     # test rapide
+# sub = executer(df, resultats)                  # complet — DthAmt=DthCnt_pred x Sévérité_pred
