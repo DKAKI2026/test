@@ -1,53 +1,393 @@
 # -*- coding: utf-8 -*-
 """
-Diagnostic de la deviance sur `resultats` quand on connait les vraies valeurs.
-Usage (notebook) :
-    diagnostic(sub, verite)
-    # sub    = sortie de executer(df, resultats)
-    # verite = resultats avec les VRAIES DthCnt / DthAmt, meme ordre de lignes
+Prédire DthCnt (nombre de décès) et DthAmt (montant) — LightGBM seul
++ DIAGNOSTIC de la déviance sur les vraies valeurs de resultats.
+
+FICHIER UNIQUE — contenu
+  1. Imports et constantes          6. Sauvegarde / chargement / prédiction
+  2. Métrique                       7. Contrôle des données + pipeline run()
+  3. Préparation des variables      8. EXÉCUTION            executer()
+  4. Variables de cohorte           9. DIAGNOSTIC           diagnostic()
+  5. Entraînement                  10. TEST DE BOUT EN BOUT tester()
+
+Utilisation (notebook où df et resultats existent, resultats AVEC les vraies DthCnt / DthAmt) :
+    sub = tester(df, resultats, rapide=True)   # test rapide (quelques minutes)
+    sub = tester(df, resultats)                # entraînement complet + diagnostic
 """
+import pickle
+
 import numpy as np
 import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import KFold
 
 
+# ============================================================================================
+# SECTION 1 — Imports et constantes
+# ============================================================================================
+TARGETS = ["DthCnt", "DthAmt"]
+REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
+            "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+
+KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
+GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
+
+FEATS_BASE = ["YearStart", "Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par", "Size",
+              "IssueAge", "PolYear", "AttdAge", "IssueYear", "log_qx", "log_qx_ratio",
+              "log_avg_size", "cv2", "log_expos"]
+FEATS_COH = ["coh_ae_cnt", "coh_ae_amt", "coh_log_E"]
+
+PARAMS = dict(learning_rate=0.03, num_leaves=63, min_data_in_leaf=50, feature_fraction=0.8,
+              bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0, verbose=-1)
+
+
+# ============================================================================================
+# SECTION 2 — Métrique : déviance de Poisson
+# ============================================================================================
 def dev_lignes(y, p):
-    """Deviance de Poisson ligne par ligne (meme formule que METRIC)."""
-    y = np.asarray(y, float)
-    p = np.clip(np.asarray(p, float), 1e-12, None)
-    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
-    return 2 * (t - (y - p))
+    """Déviance de Poisson ligne par ligne."""
+    y = np.asarray(y, dtype=float)
+    p = np.clip(np.asarray(p, dtype=float), 1e-12, None)
+    terme = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return 2 * (terme - (y - p))
 
 
+def METRIC(y, p):
+    """Déviance de Poisson totale (plus petit = mieux)."""
+    return float(np.sum(dev_lignes(y, p)))
+
+
+def pdev(y, p):
+    """Déviance de Poisson moyenne par ligne."""
+    return METRIC(y, p) / max(len(np.asarray(y)), 1)
+
+
+# ============================================================================================
+# SECTION 3 — Préparation des variables
+# ============================================================================================
+def prep(d):
+    d = d.copy()
+    d["Year"] = pd.to_numeric(d["Year"]).astype(int)
+    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009, 2223 -> 2022
+    d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
+    if "AttdAge" not in d.columns:
+        d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
+    d["IssueYear"] = d["YearStart"] - d["PolYear"]
+    e = d["ExposCnt"].clip(lower=1e-9)
+    a = d["ExposAmt"].clip(lower=1e-9)
+    d["qx_cnt"] = (d["ExpecCnt"] / e).clip(lower=1e-9)
+    d["qx_amt"] = (d["ExpecAmt"] / a).clip(lower=1e-9)
+    d["log_qx"] = np.log(d["qx_cnt"])
+    d["log_qx_ratio"] = np.log(d["qx_amt"] / d["qx_cnt"])
+    d["log_avg_size"] = np.log(a / e)
+    d["cv2"] = d["ExposAmt2"] * e / a ** 2
+    d["log_expos"] = np.log(e)
+    d["eff_n"] = a ** 2 / d["ExposAmt2"].clip(lower=1e-9)
+    return d
+
+
+# ============================================================================================
+# SECTION 4 — Variables de cohorte
+# ============================================================================================
+def cohort_table(src, k=1.0):
+    g = (src.groupby(KEY, sort=False)
+            .agg(D=("DthCnt", "sum"), E=("ExpecCnt", "sum"),
+                 DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum"))
+            .reset_index())
+    k_amt = k * src["ExpecAmt"].sum() / max(src["ExpecCnt"].sum(), 1e-9)
+    return g, k_amt
+
+
+def cohort_from_table(g, k_amt, dst, k=1.0):
+    m = dst[KEY].merge(g, on=KEY, how="left").fillna(0.0)
+    return pd.DataFrame({
+        "coh_ae_cnt": ((m["D"] + k) / (m["E"] + k)).values,
+        "coh_ae_amt": ((m["DA"] + k_amt) / (m["EA"] + k_amt)).values,
+        "coh_log_E": np.log1p(m["E"]).values}, index=dst.index)
+
+
+def cohort_apply(src, dst, k=1.0):
+    g, k_amt = cohort_table(src, k)
+    return cohort_from_table(g, k_amt, dst, k)
+
+
+def cohort_oof(src, n_splits=5, seed=0):
+    out = pd.DataFrame(index=src.index, columns=FEATS_COH, dtype=float)
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
+        out.iloc[va] = cohort_apply(src.iloc[tr], src.iloc[va]).values
+    return out
+
+
+# ============================================================================================
+# SECTION 5 — Entraînement
+# ============================================================================================
+def fit(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
+    p = dict(params, objective="poisson", seed=seed)
+    dtr = lgb.Dataset(Xtr, ytr, weight=wtr, init_score=otr)
+    dva = lgb.Dataset(Xva, yva, weight=wva, init_score=ova, reference=dtr)
+    return lgb.train(p, dtr, max_rounds, valid_sets=[dva],
+                     callbacks=[lgb.early_stopping(100, verbose=False)])
+
+
+def raw(m, X):
+    return m.predict(X, raw_score=True, num_iteration=m.best_iteration)
+
+
+def cnt_targets(d):
+    return d["DthCnt"].values, np.log(d["ExpecCnt"].clip(lower=1e-9)).values
+
+
+def amt_targets(d, w0):
+    y = (d["DthAmt"] / d["ExposAmt"].clip(lower=1e-9)).values
+    return y, np.log(d["qx_amt"]).values, (d["eff_n"] / w0).values
+
+
+def make_folds(df, mode, n_splits, seed=42):
+    if mode == "interleaved":
+        return list(KFold(n_splits, shuffle=True, random_state=seed).split(df))
+    ys = np.sort(df["YearStart"].unique())[-3:]
+    yr = df["YearStart"].values
+    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
+
+
+def rep(name, y, p, extra=""):
+    print(f"  {name:<44s} devPoisson_moy={pdev(y, p):>14,.5f}  devPoisson_tot={METRIC(y, p):>18,.2f}"
+          f"  somme_pred/somme_reel={p.sum() / y.sum():.4f} {extra}")
+
+
+# ============================================================================================
+# SECTION 6 — Sauvegarde, chargement et prédiction
+# ============================================================================================
+def save_bundle(bundle, path):
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def predict(bundle, resultats):
+    miss = [c for c in REQUIRED if c not in resultats.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+    res = prep(resultats).reset_index(drop=True)
+    if bundle["mode"] == "interleaved":
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res, bundle["coh_k"])], axis=1)
+    X = res[bundle["feats"]]
+    off_c = np.log(res["ExpecCnt"].clip(lower=1e-9)).values
+    off_a = np.log(res["qx_amt"]).values
+    te_c = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off_c)
+                    for m in bundle["models_c"]], axis=0)
+    te_a = np.mean([res["ExposAmt"].values * np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off_a)
+                    for m in bundle["models_a"]], axis=0)
+    b_te = te_c * np.exp(res["log_avg_size"].values) * \
+        pd.Series(bundle["calib_size"]).reindex(res["Size"].values).fillna(1).values
+    w = bundle["w_blend"]
+    sub = resultats.copy().reset_index(drop=True)
+    sub["DthCnt"] = np.clip(te_c * bundle["f_c"], 0, None)
+    sub["DthAmt"] = np.clip((w * te_a + (1 - w) * b_te) * bundle["f_a"], 0, None)
+    return sub
+
+
+# ============================================================================================
+# SECTION 7 — Contrôle des données + pipeline d'entraînement
+# ============================================================================================
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
+
+
+def _lignes_invalides(d, cols):
+    x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return ~np.isfinite(x).all(axis=1)
+
+
+def verifier_donnees(df, resultats=None, verbose=True):
+    if verbose:
+        rows = []
+        for nom, d, cols in (("df", df, REQUIRED + TARGETS), ("resultats", resultats, REQUIRED)):
+            if d is None:
+                continue
+            for c in cols:
+                x = pd.to_numeric(d[c], errors="coerce")
+                bad = int((~np.isfinite(x.to_numpy(float))).sum())
+                if bad:
+                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques")
+        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+    if resultats is not None:
+        bad_r = _lignes_invalides(resultats, CRITIQUES)
+        assert not bad_r.any(), (
+            f"{int(bad_r.sum())} lignes de resultats invalides dans {CRITIQUES} "
+            f"(index : {list(resultats.index[bad_r][:5])}).")
+    bad = _lignes_invalides(df, CRITIQUES + TARGETS)
+    if bad.any():
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement.")
+        df = df.loc[~bad]
+    return df
+
+
+def run(df, mode, n_splits=5, seeds=(0, 1, 2), max_rounds=3000, params=None,
+        verbose=True, save_path=None):
+    params = dict(PARAMS, **(params or {}))
+    miss = [c for c in REQUIRED + TARGETS if c not in df.columns]
+    assert not miss, f"Colonnes manquantes : {miss}"
+
+    df = prep(df).reset_index(drop=True)
+    use_coh = mode == "interleaved"
+    feats = FEATS_BASE + (FEATS_COH if use_coh else [])
+    if not use_coh:
+        feats = [f for f in feats if f not in ("YearStart", "IssueYear")]
+    w0 = df["eff_n"].mean()
+    if verbose:
+        print(f"Mode : {mode} | lignes df={len(df):,} | {len(feats)} features")
+
+    n = len(df)
+    oof_c, oof_a = np.full(n, np.nan), np.full(n, np.nan)
+    models_c, models_a = [], []
+
+    for k, (tr, va) in enumerate(make_folds(df, mode, n_splits)):
+        d_tr0, d_va0 = df.iloc[tr], df.iloc[va]
+        if use_coh:
+            d_tr = pd.concat([d_tr0, cohort_oof(d_tr0, seed=k)], axis=1)
+            d_va = pd.concat([d_va0, cohort_apply(d_tr0, d_va0)], axis=1)
+        else:
+            d_tr, d_va = d_tr0, d_va0
+        yc_tr, oc_tr = cnt_targets(d_tr); yc_va, oc_va = cnt_targets(d_va)
+        ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0); ya_va, oa_va, wa_va = amt_targets(d_va, w0)
+        pc_va, pa_va = np.zeros(len(va)), np.zeros(len(va))
+        for s in seeds:
+            mc = fit(d_tr[feats], yc_tr, oc_tr, None, d_va[feats], yc_va, oc_va, None, s, max_rounds, params)
+            ma = fit(d_tr[feats], ya_tr, oa_tr, wa_tr, d_va[feats], ya_va, oa_va, wa_va, s, max_rounds, params)
+            pc_va += np.exp(raw(mc, d_va[feats]) + oc_va) / len(seeds)
+            pa_va += d_va["ExposAmt"].values * np.exp(raw(ma, d_va[feats]) + oa_va) / len(seeds)
+            models_c.append(mc.model_to_string(num_iteration=mc.best_iteration))
+            models_a.append(ma.model_to_string(num_iteration=ma.best_iteration))
+        oof_c[va], oof_a[va] = pc_va, pa_va
+        if verbose:
+            print(f"  pli {k + 1}: iter cnt={mc.best_iteration}, iter amt={ma.best_iteration}")
+
+    cov = ~np.isnan(oof_c)
+    yc, ya = df["DthCnt"].values[cov], df["DthAmt"].values[cov]
+    if verbose:
+        print("\n== DthCnt - validation hors-pli (sur df) ==")
+        rep("Baseline ICA (ExpecCnt)", yc, df["ExpecCnt"].values[cov])
+        rep("Modele GBM Poisson + offset", yc, oof_c[cov])
+
+    avg_size = np.exp(df["log_avg_size"].values)
+    calib = (pd.Series(ya).groupby(df["Size"].values[cov]).sum() /
+             pd.Series(oof_c[cov] * avg_size[cov]).groupby(df["Size"].values[cov]).sum()
+             ).replace([np.inf, -np.inf], 1).fillna(1)
+    b_oof = oof_c[cov] * avg_size[cov] * calib.reindex(df["Size"].values[cov]).fillna(1).values
+    a_oof = oof_a[cov]
+    ws = np.linspace(0, 1, 11)
+    w_best = ws[int(np.argmin([METRIC(ya, w * a_oof + (1 - w) * b_oof) for w in ws]))]
+    blend_oof = w_best * a_oof + (1 - w_best) * b_oof
+    if verbose:
+        print("\n== DthAmt - validation hors-pli (sur df) ==")
+        rep("Baseline ICA (ExpecAmt)", ya, df["ExpecAmt"].values[cov])
+        rep("A. GBM montant direct", ya, a_oof)
+        rep("B. deces predits x montant moyen", ya, b_oof)
+        rep(f"Blend (poids A={w_best:.1f})", ya, blend_oof)
+
+    f_c, f_a = yc.sum() / oof_c[cov].sum(), ya.sum() / blend_oof.sum()
+    if verbose:
+        print(f"\nCalibration : DthCnt x{f_c:.4f} | DthAmt x{f_a:.4f}")
+
+    bundle = dict(mode=mode, feats=feats, models_c=models_c, models_a=models_a,
+                  w_blend=float(w_best), f_c=float(f_c), f_a=float(f_a),
+                  calib_size={int(k): float(v) for k, v in calib.items()}, coh_k=1.0)
+    if use_coh:
+        bundle["coh_g"], bundle["coh_k_amt"] = cohort_table(df, bundle["coh_k"])
+    if save_path:
+        save_bundle(bundle, save_path)
+        if verbose:
+            print(f"Modele sauvegarde : {save_path}")
+    return bundle
+
+
+# ============================================================================================
+# SECTION 8 — EXÉCUTION (entraînement sur df, prédiction sur resultats)
+# ============================================================================================
+def executer(df, resultats, save_path="modele_mortalite.pkl", out_csv="soumission.csv", rapide=False):
+    df = verifier_donnees(df, resultats)
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    mode = "interleaved" if part > 0.9 else "temporal"
+    print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
+
+    kw = dict(params=dict(learning_rate=0.1), seeds=(0,), n_splits=3, max_rounds=500) if rapide else {}
+    bundle = run(df, mode=mode, save_path=save_path, **kw)
+
+    sub = predict(bundle, resultats)
+    assert len(sub) == len(resultats), "le nombre de lignes a change"
+    assert sub[TARGETS].notna().all().all(), "des predictions sont manquantes"
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)")
+    return sub
+
+
+# ============================================================================================
+# SECTION 9 — DIAGNOSTIC sur les vraies valeurs
+# ============================================================================================
 def diagnostic(sub, verite):
+    """sub = prédictions, verite = mêmes lignes avec les vraies DthCnt / DthAmt (même ordre)."""
+    sub, verite = sub.reset_index(drop=True), verite.reset_index(drop=True)
     assert len(sub) == len(verite), "sub et verite n'ont pas le meme nombre de lignes"
+
     for cible, base in (("DthCnt", "ExpecCnt"), ("DthAmt", "ExpecAmt")):
-        y = verite[cible].to_numpy(float)
-        p = sub[cible].to_numpy(float)
-        b = verite[base].to_numpy(float)
+        y_all = pd.to_numeric(verite[cible], errors="coerce").to_numpy(float)
+        ok = np.isfinite(y_all)
+        y = y_all[ok]
+        p = sub[cible].to_numpy(float)[ok]
+        b = verite[base].to_numpy(float)[ok]
         d_mod, d_ica = dev_lignes(y, p), dev_lignes(y, b)
         z = y == 0
 
-        print(f"\n==================== {cible} ====================")
-        print(f"Lignes avec {cible}=0 : {z.mean():.1%}")
-        print(f"Deviance totale   modele = {d_mod.sum():,.0f}   |   baseline ICA = {d_ica.sum():,.0f}")
-        print(f"Gain vs ICA (D2)  = {1 - d_mod.sum() / d_ica.sum():+.2%}   (positif = le modele bat l'ICA)")
+        print(f"\n{'=' * 25} {cible} {'=' * 25}")
+        if (~ok).any():
+            print(f"({int((~ok).sum()):,} lignes sans vraie valeur ignorees)")
+        print(f"Lignes avec {cible}=0 (reel)           : {z.mean():.1%}")
+        print(f"Predictions exactement 0             : {(p == 0).sum():,} "
+              f"(dont {int(((p == 0) & (b == 0)).sum()):,} avec {base}=0)")
+        print(f"Deviance totale  MODELE = {d_mod.sum():,.0f}")
+        print(f"Deviance totale  ICA    = {d_ica.sum():,.0f}")
+        print(f"Gain vs ICA (D2)        = {1 - d_mod.sum() / d_ica.sum():+.2%}   (positif = modele meilleur)")
         print(f"Part de la deviance venant des lignes y=0 : modele {d_mod[z].sum() / d_mod.sum():.1%}"
               f" | ICA {d_ica[z].sum() / d_ica.sum():.1%}")
-        print(f"Somme pred / somme reel = {p.sum() / y.sum():.4f}   (ICA : {b.sum() / y.sum():.4f})")
+        print(f"Somme pred / somme reel : modele {p.sum() / y.sum():.4f} | ICA {b.sum() / y.sum():.4f}")
         if cible == "DthCnt":
-            print("Predictions 'quasi nulles' : " +
+            print("Predictions quasi nulles : " +
                   " | ".join(f"< {s}: {(p < s).mean():.1%}" for s in (1e-3, 1e-2, 0.05, 0.1)))
 
-        # Test : que se passe-t-il si on force a 0 les petites predictions ?
-        print("Test 'forcer a 0' :")
+        print("Test 'forcer a 0 les petites predictions' :")
         for q in (0.5, 0.8, 0.9, 0.97):
             s = np.quantile(p, q)
             p0 = np.where(p < s, 0.0, p)
             print(f"  pred < {s:.4g} (quantile {q:.0%}) -> 0  =>  deviance {dev_lignes(y, p0).sum():,.0f}")
 
         t = pd.DataFrame({"y": y, "pred": p, "ica": b, "dev_mod": d_mod, "dev_ica": d_ica,
-                          "Size": verite["Size"].values})
-        print("\nTop 10 lignes qui pesent le plus dans la deviance du modele :")
+                          "Size": verite["Size"].values[ok], "Year": verite["Year"].values[ok]})
+        print("\nTop 10 lignes les plus couteuses (modele) :")
         print(t.nlargest(10, "dev_mod").round(3).to_string())
-        print("\nDeviance par tranche Size (modele vs ICA) :")
+        print("\nDeviance par Size (modele vs ICA) :")
         print(t.groupby("Size")[["dev_mod", "dev_ica"]].sum().round(0).to_string())
+        print("\nDeviance par Year (modele vs ICA) :")
+        print(t.groupby("Year")[["dev_mod", "dev_ica"]].sum().round(0).to_string())
+
+
+# ============================================================================================
+# SECTION 10 — TEST DE BOUT EN BOUT
+# ============================================================================================
+def tester(df, resultats_vrais, rapide=False, save_path="modele_mortalite.pkl", out_csv="soumission.csv"):
+    """
+    resultats_vrais = resultats AVEC les vraies DthCnt / DthAmt.
+    Les cibles sont retirées avant la prédiction (aucune fuite), puis comparées aux prédictions.
+    """
+    verite = resultats_vrais.reset_index(drop=True)
+    a_predire = verite.drop(columns=TARGETS, errors="ignore")
+    sub = executer(df, a_predire, save_path=save_path, out_csv=out_csv, rapide=rapide)
+    diagnostic(sub, verite)
+    return sub
+
+
+# Exemple (décommente la ligne voulue) :
+# sub = tester(df, resultats, rapide=True)   # test rapide
+# sub = tester(df, resultats)                # complet
