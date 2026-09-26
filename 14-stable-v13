@@ -417,3 +417,7 @@ def tester(df, resultats_vrais, rapide=False, validation="temporal",
 
 # sub = tester(df, resultats, rapide=True)   # test rapide
 # sub = tester(df, resultats)                # complet
+
+
+print(resultats[["DthCnt", "DthAmt"]].describe())
+print("Lignes avec DthCnt > 0 :", (pd.to_numeric(resultats["DthCnt"], errors="coerce") > 0).sum())
