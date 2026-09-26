@@ -1,0 +1,295 @@
+# -*- coding: utf-8 -*-
+"""
+AJOUTS au script DthAmt — a coller A LA FIN du script existant (apres la Section 13).
+Reutilise : prep, fit, raw, make_folds, verifier_donnees, run, PARAMS, CANDIDATES_BASE,
+            TARGET, REQUIRED, apply_smooth_baseline, cohort_from_table.
+
+Contenu :
+  A. Deviance par ligne + PLANCHER DE BRUIT (deviance minimale atteignable)
+  B. DIAGNOSTIC PAR TRANCHE D'AGE ATTEINT (D2 vs ICA, % du reductible capture)
+  C. Modele D : FREQUENCE (Poisson DthCnt) x SEVERITE (Gamma montant moyen par deces)
+  D. Blend a N modeles optimise sur la DEVIANCE (plus sur le RMSE)
+  E. Calibration isotonique sur le RATIO A/E (pas sur les montants) + plancher, croisee
+  F. executer_v2 : pipeline complet
+"""
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from scipy.optimize import minimize
+from sklearn.model_selection import KFold
+from sklearn.isotonic import IsotonicRegression
+
+AGE_BINS = [0, 30, 40, 50, 60, 70, 80, 90, 200]
+
+
+# ============================================================================================
+# A. Deviance par ligne + plancher de bruit
+# ============================================================================================
+def dev_lignes(y, p, p_min=1e-9):
+    """Deviance de Poisson ligne par ligne (y=0 -> 2p : quasi nulle aux jeunes ages)."""
+    y = np.asarray(y, float)
+    p = np.clip(np.asarray(p, float), p_min, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1.0) / p), 0.0)
+    return 2.0 * (t - (y - p))
+
+
+def plancher_bruit(p_cnt, p_amt, cv2, n_sim=30, seed=0):
+    """
+    Deviance ATTENDUE si le modele etait le vrai processus (bruit irreductible).
+    Deces N ~ Poisson(p_cnt) ; montant = somme de N montants individuels
+    (Gamma, moyenne p_amt/p_cnt, CV^2 = cv2 - 1 tire de ExposAmt2).
+    -> Si ta deviance est proche de ce plancher, il n'y a plus rien a gagner.
+    """
+    rng = np.random.default_rng(seed)
+    p_cnt = np.clip(np.asarray(p_cnt, float), 1e-12, None)
+    p_amt = np.clip(np.asarray(p_amt, float), 1e-12, None)
+    m = p_amt / p_cnt
+    k = 1.0 / np.clip(np.asarray(cv2, float) - 1.0, 1e-3, None)
+    dc, da = np.zeros(len(p_cnt)), np.zeros(len(p_cnt))
+    for _ in range(n_sim):
+        n = rng.poisson(p_cnt)
+        amt = np.where(n > 0, rng.gamma(np.maximum(n * k, 1e-12), m / k), 0.0)
+        dc += dev_lignes(n, p_cnt) / n_sim
+        da += dev_lignes(amt, p_amt) / n_sim
+    return dc, da
+
+
+# ============================================================================================
+# B. Diagnostic par tranche d'age atteint
+# ============================================================================================
+def diagnostic_par_age(d, pred_amt, pred_cnt=None, bins=AGE_BINS):
+    """d : df prepare (prep), aligne sur pred_amt. Retourne (table montants, table comptes)."""
+    d = d.reset_index(drop=True)
+    pred_amt = np.asarray(pred_amt, float)
+    if pred_cnt is None:   # approx : meme A/E en compte qu'en montant
+        pred_cnt = d["ExpecCnt"].values * pred_amt / d["ExpecAmt"].clip(lower=1e-9).values
+    pred_cnt = np.asarray(pred_cnt, float)
+    floor_c, floor_a = plancher_bruit(pred_cnt, pred_amt, d["cv2"].values)
+
+    r = pd.DataFrame({
+        "tranche": pd.cut(d["AttdAge"], bins, right=False), "n": 1.0,
+        "obs": d["DthAmt"].values, "ica": d["ExpecAmt"].values, "pred": pred_amt,
+        "dev_m": dev_lignes(d["DthAmt"].values, pred_amt),
+        "dev_ica": dev_lignes(d["DthAmt"].values, d["ExpecAmt"].values),
+        "dev_pl": floor_a,
+        "obs_c": d["DthCnt"].values, "ica_c": d["ExpecCnt"].values, "pred_c": pred_cnt,
+        "devc_m": dev_lignes(d["DthCnt"].values, pred_cnt),
+        "devc_ica": dev_lignes(d["DthCnt"].values, d["ExpecCnt"].values),
+        "devc_pl": floor_c})
+    g = r.groupby("tranche", observed=True).sum(numeric_only=True)
+    g.loc["TOTAL"] = g.sum()
+
+    def table(o, i, p, dm, di, dp):
+        return pd.DataFrame({
+            "lignes": g["n"].astype(int),
+            "A/E obs": g[o] / g[i].clip(lower=1e-9),
+            "Pred/Obs": g[p] / g[o].clip(lower=1e-9),
+            "dev_moy_modele": g[dm] / g["n"],
+            "dev_moy_ICA": g[di] / g["n"],
+            "dev_moy_plancher": g[dp] / g["n"],
+            "D2_vs_ICA": 1 - g[dm] / g[di].clip(lower=1e-12),
+            "%_reductible_capture": (g[di] - g[dm]) / (g[di] - g[dp]).clip(lower=1e-12),
+            "part_dev_totale": g[dm] / g.loc["TOTAL", dm]}).round(4)
+
+    return (table("obs", "ica", "pred", "dev_m", "dev_ica", "dev_pl"),
+            table("obs_c", "ica_c", "pred_c", "devc_m", "devc_ica", "devc_pl"))
+
+
+# ============================================================================================
+# C. Modele D : frequence x severite
+# ============================================================================================
+PARAMS_SEV = dict(learning_rate=0.02, num_leaves=15, min_data_in_leaf=300,
+                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+                  lambda_l2=50.0, verbose=-1)   # severite tres bruitee -> forte regularisation
+
+
+def feats_defaut(mode):
+    return [c for c in CANDIDATES_BASE
+            if mode == "interleaved" or c not in ("YearStart", "IssueYear")]
+
+
+def cnt_targets(d):
+    e = d["ExposCnt"].clip(lower=1e-9)
+    return (d["DthCnt"] / e).values, np.log(d["qx_cnt"]).values, (e / e.mean()).values
+
+
+def log_sev_ica(d):
+    """Severite ICA = montant moyen attendu par deces = ExpecAmt / ExpecCnt."""
+    return np.log((d["ExpecAmt"] / d["ExpecCnt"].clip(lower=1e-9)).clip(lower=1e-9)).values
+
+
+def sev_targets(d):
+    msk = d["DthCnt"].values > 0
+    y = d["DthAmt"].values / np.where(msk, d["DthCnt"].values, 1.0)
+    w = d["DthCnt"].values / max(d["DthCnt"].values[msk].mean(), 1e-9)
+    return msk, y, log_sev_ica(d), w
+
+
+def train_freq_sev(df, mode, feats=None, n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+                   params=None, params_sev=None, verbose=True):
+    """df deja passe par prep() + reset_index. Memes plis que train_ensemble (make_folds)."""
+    params = dict(PARAMS, **(params or {}))
+    params_sev = dict(PARAMS_SEV, **(params_sev or {}))
+    feats = feats or feats_defaut(mode)
+    n = len(df)
+    oof_cnt, oof_amt = np.full(n, np.nan), np.full(n, np.nan)
+    models = {"freq": [], "sev": []}
+    for k, (tr, va) in enumerate(make_folds(df, mode, n_splits)):
+        d_tr, d_va = df.iloc[tr], df.iloc[va]
+        Xtr, Xva = d_tr[feats], d_va[feats]
+        yc_tr, oc_tr, wc_tr = cnt_targets(d_tr)
+        yc_va, oc_va, wc_va = cnt_targets(d_va)
+        ms_tr, ys_tr, os_tr, ws_tr = sev_targets(d_tr)
+        ms_va, ys_va, os_va, ws_va = sev_targets(d_va)
+        pc, ps = np.zeros(len(va)), np.zeros(len(va))
+        for s in seeds:
+            mf = fit(Xtr, yc_tr, oc_tr, wc_tr, Xva, yc_va, oc_va, wc_va, s, max_rounds, params)
+            pc += d_va["ExposCnt"].values * np.exp(raw(mf, Xva) + oc_va) / len(seeds)
+            msv = fit(Xtr[ms_tr], ys_tr[ms_tr], os_tr[ms_tr], ws_tr[ms_tr],
+                      Xva[ms_va], ys_va[ms_va], os_va[ms_va], ws_va[ms_va],
+                      s, max_rounds, params_sev, objective="gamma")
+            ps += np.exp(raw(msv, Xva) + os_va) / len(seeds)
+            models["freq"].append(mf.model_to_string(num_iteration=mf.best_iteration))
+            models["sev"].append(msv.model_to_string(num_iteration=msv.best_iteration))
+        oof_cnt[va], oof_amt[va] = pc, pc * ps
+        if verbose:
+            print(f"  pli {k + 1}: freq x sev ok | A/E sev moyen predit = "
+                  f"{np.average(np.exp(np.log(ps) - os_va), weights=pc):.3f}")
+    return dict(feats=feats, models=models, oof_cnt=oof_cnt, oof_amt=oof_amt)
+
+
+def predict_freq_sev(fs, res):
+    """res : resultats deja passes par prep() + reset_index."""
+    X = res[fs["feats"]]
+    off_c, off_s = np.log(res["qx_cnt"]).values, log_sev_ica(res)
+    pc = np.mean([res["ExposCnt"].values *
+                  np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off_c)
+                  for m in fs["models"]["freq"]], axis=0)
+    ps = np.mean([np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off_s)
+                  for m in fs["models"]["sev"]], axis=0)
+    return pc, pc * ps
+
+
+# ============================================================================================
+# D. Blend a N modeles sur la deviance
+# ============================================================================================
+def blend_poids(y, preds, metrique="deviance"):
+    names = list(preds)
+    P = np.column_stack([preds[k] for k in names])
+    if metrique == "deviance":
+        f = lambda p: dev_lignes(y, p).mean()
+    else:
+        f = lambda p: float(np.sqrt(np.mean((y - p) ** 2)))
+
+    def w_of(z):
+        w = np.exp(z - z.max())
+        return w / w.sum()   # poids >= 0, somme = 1
+
+    best = minimize(lambda z: f(P @ w_of(z)), np.zeros(len(names)), method="Nelder-Mead",
+                    options=dict(maxiter=4000, xatol=1e-5, fatol=1e-8))
+    return dict(zip(names, w_of(best.x))), float(best.fun)
+
+
+# ============================================================================================
+# E. Calibration isotonique sur le ratio A/E (croisee, avec plancher)
+# ============================================================================================
+def calibration_ratio_croisee(y, p, expec, plancher_ae=0.05, n_splits=5, seed=0):
+    """
+    Isotonique sur A/E predit -> A/E observe, pondere par ExpecAmt.
+    - Echelle homogene (plus dominee par les grosses polices)
+    - Balance exacte : somme(pred calibree) = somme(observe)
+    - y_min = plancher A/E : jamais de prediction ~0 aux jeunes ages
+    - Score HORS-PLI honnete (l'ancien score isotonique etait mesure en echantillon)
+    """
+    e = np.clip(np.asarray(expec, float), 1e-9, None)
+    rp, ry = np.asarray(p, float) / e, np.asarray(y, float) / e
+    out = np.empty(len(rp))
+    for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(rp):
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=plancher_ae)
+        iso.fit(rp[tr], ry[tr], sample_weight=e[tr])
+        out[va] = e[va] * iso.predict(rp[va])
+    iso_full = IsotonicRegression(out_of_bounds="clip", y_min=plancher_ae)
+    iso_full.fit(rp, ry, sample_weight=e)
+    return out, iso_full
+
+
+def appliquer_calibration(iso, p, expec):
+    e = np.clip(np.asarray(expec, float), 1e-9, None)
+    return e * iso.predict(np.asarray(p, float) / e)
+
+
+# ============================================================================================
+# F. Pipeline complet
+# ============================================================================================
+def _preds_ABC(bundle, res):
+    """Predictions brutes des modeles A, B, C du bundle existant (sans blend ni isotonique)."""
+    if bundle["mode"] == "interleaved":
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["k_amt"],
+                                                bundle["k_cnt"], res)], axis=1)
+    sm = apply_smooth_baseline(bundle["spline"], bundle["sm_model"], res)
+    res = res.assign(smooth_log_ae=sm)
+    X, off, ea = res[bundle["feats"]], np.log(res["qx_amt"]).values, res["ExposAmt"].values
+
+    def moy(key, extra):
+        return np.mean([ea * np.exp(lgb.Booster(model_str=m).predict(X, raw_score=True) + off + extra)
+                        for m in bundle["models"][key]], axis=0)
+    return {"A": moy("A", 0.0), "B": moy("B", sm), "C": moy("C", 0.0)}
+
+
+def executer_v2(df, resultats, rapide=False, plancher_ae=0.05, metrique="deviance",
+                out_csv="soumission_dthamt_v2.csv"):
+    df = verifier_donnees(df, resultats)
+    part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
+    mode = "interleaved" if part > 0.9 else "temporal"
+    kw = dict(seeds=(0,), n_splits=3, max_rounds=500) if rapide else {}
+
+    # 1) modeles A, B, C existants
+    out = run(df, mode=mode, selection_max_rounds=200 if rapide else 800, **kw)
+    dfp = prep(df).reset_index(drop=True)
+
+    # 2) modele D : frequence x severite (memes plis)
+    print("\n== Modele D : frequence x severite ==")
+    fs = train_freq_sev(dfp, mode, **kw)
+
+    cov = ~np.isnan(out["oof"]["A"]) & ~np.isnan(fs["oof_amt"])
+    y, expec = dfp[TARGET].values[cov], dfp["ExpecAmt"].values[cov]
+    preds = {k: out["oof"][k][cov] for k in ("A", "B", "C")}
+    preds["D"] = fs["oof_amt"][cov]
+
+    print(f"\n== Deviance moyenne hors-pli (DthAmt) ==")
+    print(f"  ICA : {dev_lignes(y, expec).mean():,.2f}")
+    for k, p in preds.items():
+        print(f"  {k}   : {dev_lignes(y, p).mean():,.2f}")
+
+    # 3) blend sur la deviance
+    w, sc = blend_poids(y, preds, metrique)
+    blend = sum(w[k] * preds[k] for k in preds)
+    print(f"\nPoids : { {k: round(v, 3) for k, v in w.items()} } -> {metrique} = {sc:,.2f}")
+
+    # 4) calibration croisee sur ratio A/E
+    calib, iso = calibration_ratio_croisee(y, blend, expec, plancher_ae)
+    print(f"Deviance apres calibration (HORS-PLI) = {dev_lignes(y, calib).mean():,.2f} | "
+          f"balance = {calib.sum() / y.sum():.4f}")
+
+    # 5) diagnostic par age
+    t_amt, t_cnt = diagnostic_par_age(dfp[cov], calib, fs["oof_cnt"][cov])
+    with pd.option_context("display.width", 200, "display.max_columns", 20):
+        print("\n== Diagnostic MONTANTS par age atteint ==\n", t_amt)
+        print("\n== Diagnostic COMPTES par age atteint ==\n", t_cnt)
+
+    # 6) soumission
+    res = prep(resultats).reset_index(drop=True)
+    pr = _preds_ABC(out["bundle"], res)
+    _, pr["D"] = predict_freq_sev(fs, res)
+    final = appliquer_calibration(iso, sum(w[k] * pr[k] for k in pr), res["ExpecAmt"].values)
+    sub = resultats.copy()
+    sub[TARGET] = np.clip(final, 0, None)
+    assert len(sub) == len(resultats) and sub[TARGET].notna().all()
+    sub.to_csv(out_csv, index=False)
+    print(f"\nSoumission ecrite : {out_csv} ({len(sub):,} lignes)")
+    return dict(sub=sub, weights=w, diag_amt=t_amt, diag_cnt=t_cnt, fs=fs, out=out, iso=iso)
+
+
+# Exemple :
+# r = executer_v2(df, resultats, rapide=True)   # test de bout en bout
+# r = executer_v2(df, resultats)                # version complete
