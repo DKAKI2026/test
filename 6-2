@@ -226,7 +226,7 @@ def table_strates(d, strate, n_plein=N_PLEIN):
     g["Z"] = credibilite(g["Deces"], n_plein)
     g["Facteur"] = g["Z"] * g["Ratio"]
     g["Poids"] = g["Attendu"] / g["Attendu"].sum()
-    g["Fiabilite"] = g["Z"].map(lambda z: {"bas": "Faible", "moyen": "Moyenne", "haut": "Bonne"}[niveau_pct(z)])
+    g["Fiabilite"] = g["Z"].map(lambda z: {"bas": "Faible", "moyen": "Moyenne", "haut": "Bonne"}.get(niveau_pct(z), "Inconnue"))
     for c in cols:
         if c in LIBELLES:
             g[c + "_libelle"] = g[c].map(LIBELLES[c]).fillna(g[c].astype(str))
@@ -770,10 +770,7 @@ def predire(bundle, resultats):
 
 
 
-
-
-
- # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 FRONTEND (Streamlit) — ne contient AUCUN calcul : tout est délégué à backend.py.
 Assistant pas-à-pas : données -> strates & crédibilité -> facteur -> algorithme -> colonnes -> entraînement -> résultats.
@@ -798,6 +795,11 @@ assert hasattr(b, "ALGOS"), (
     f"Le module 'backend' chargé ({b.__file__}) n'est pas le bon fichier : il n'a pas d'attribut ALGOS. "
     "Un autre module nommé 'backend' existe ailleurs sur ton système. Renomme ton fichier local "
     "(par ex. backend_mortalite.py) et adapte l'import ci-dessus en conséquence.")
+
+assert hasattr(b, "niveau_pct"), (
+    f"Le fichier backend.py chargé ({b.__file__}) est une VERSION PÉRIMÉE : il n'a pas la fonction "
+    "'niveau_pct' (colonnes de fiabilité colorées). Remplace ce fichier par le dernier backend.py fourni, "
+    "puis supprime le dossier __pycache__ à côté avant de relancer streamlit.")
 
 st.set_page_config(page_title="Assistant mortalité — montant des décès", page_icon="🧮", layout="wide")
 
@@ -1042,10 +1044,15 @@ elif etape == 1:
         st.caption("🟢 Vert = strate fiable (beaucoup de décès observés). 🟡 Jaune = fiabilité moyenne. "
                   "🔴 Rouge = peu de décès observés : le facteur s'appuie surtout sur la référence, pas sur cette strate.")
         cols_aff = [c for c in strate] + ["Lignes", "Deces", "Attendu", "Reel", "Ratio", "Z", "Fiabilite", "Facteur", "Poids"]
-        style = (tab[cols_aff].style
-                .format({"Attendu": "{:,.0f}", "Reel": "{:,.0f}", "Ratio": "{:.3f}", "Z": "{:.0%}",
-                        "Facteur": "{:.3f}", "Poids": "{:.1%}", "Deces": "{:,.0f}"})
-                .map(colorer_fiabilite, subset=["Z"]))
+        manquantes = [c for c in cols_aff if c not in tab.columns]
+        if manquantes:
+            st.warning(f"Colonnes attendues absentes du tableau ({manquantes}) : ton backend.py est probablement "
+                      "une version périmée. Remplace-le par le dernier fichier fourni.")
+            cols_aff = [c for c in cols_aff if c in tab.columns]
+        style = tab[cols_aff].style.format({"Attendu": "{:,.0f}", "Reel": "{:,.0f}", "Ratio": "{:.3f}", "Z": "{:.0%}",
+                                            "Facteur": "{:.3f}", "Poids": "{:.1%}", "Deces": "{:,.0f}"})
+        if "Z" in cols_aff:
+            style = style.map(colorer_fiabilite, subset=["Z"])
         st.dataframe(style, use_container_width=True, height=320)
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1343,7 +1350,6 @@ elif etape == 7:
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
-
 
 
 
