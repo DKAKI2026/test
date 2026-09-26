@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Prédire DthCnt (nombre de décès) et DthAmt (montant) — LightGBM seul
-+ DIAGNOSTIC de la déviance sur les vraies valeurs de resultats.
+Prédire DthCnt et DthAmt — LightGBM — VERSION 2 (corrige un gain négatif vs ICA).
 
-FICHIER UNIQUE — contenu
-  1. Imports et constantes          6. Sauvegarde / chargement / prédiction
-  2. Métrique                       7. Contrôle des données + pipeline run()
-  3. Préparation des variables      8. EXÉCUTION            executer()
-  4. Variables de cohorte           9. DIAGNOSTIC           diagnostic()
-  5. Entraînement                  10. TEST DE BOUT EN BOUT tester()
+Corrections par rapport à la version 1
+  1. RÉENTRAÎNEMENT SUR TOUT df : la v1 prédisait avec les modèles des plis, qui n'avaient
+     jamais vu les années les plus récentes (mode temporal). La v2 réentraîne sur tout df
+     avec le nombre d'itérations trouvé en validation.
+  2. VALIDATION TEMPORELLE par défaut (3 dernières années), même en mode interleaved :
+     plus réaliste, moins optimiste que des plis aléatoires.
+  3. RÉGULARISATION plus forte (arbres plus petits, feuilles plus grosses).
+  4. FILET DE SÉCURITÉ « rétrécissement vers l'ICA » :
+         pred = ICA x (modele/ICA)^alpha x f
+     alpha dans [0,1] choisi sur la validation. alpha=0 -> ICA recalibrée pure,
+     donc sur la validation le modèle ne peut pas faire pire que l'ICA recalibrée.
+  5. DIAGNOSTIC « niveau vs forme » pour savoir d'où vient l'écart.
 
-Utilisation (notebook où df et resultats existent, resultats AVEC les vraies DthCnt / DthAmt) :
-    sub = tester(df, resultats, rapide=True)   # test rapide (quelques minutes)
-    sub = tester(df, resultats)                # entraînement complet + diagnostic
+Utilisation (resultats AVEC les vraies DthCnt / DthAmt) :
+    sub = tester(df, resultats, rapide=True)   # test rapide
+    sub = tester(df, resultats)                # complet
 """
 import pickle
 
@@ -23,11 +28,12 @@ from sklearn.model_selection import KFold
 
 
 # ============================================================================================
-# SECTION 1 — Imports et constantes
+# SECTION 1 — Constantes
 # ============================================================================================
 TARGETS = ["DthCnt", "DthAmt"]
 REQUIRED = ["Year", "Sex", "Smoke", "PolTypeGrp", "Base", "Par", "Size", "IssueAge",
             "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"]
+CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
 
 KEY = ["Sex", "Smoke", "PolGrp", "Base", "Par", "Size", "IssueAge", "IssueYear"]
 GRP_MAP = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 11: 3, 6: 6, 7: 6, 10: 6, 8: 8, 9: 9}
@@ -37,15 +43,17 @@ FEATS_BASE = ["YearStart", "Sex", "Smoke", "PolGrp", "PolTypeGrp", "Base", "Par"
               "log_avg_size", "cv2", "log_expos"]
 FEATS_COH = ["coh_ae_cnt", "coh_ae_amt", "coh_log_E"]
 
-PARAMS = dict(learning_rate=0.03, num_leaves=63, min_data_in_leaf=50, feature_fraction=0.8,
-              bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0, verbose=-1)
+# Régularisation plus forte que la v1
+PARAMS = dict(learning_rate=0.03, num_leaves=15, min_data_in_leaf=1000, feature_fraction=0.7,
+              bagging_fraction=0.8, bagging_freq=1, lambda_l2=50.0, verbose=-1)
+# Modèle nombre : chaque feuille doit contenir au moins ~5 décès attendus
+EXTRA_CNT = dict(min_sum_hessian_in_leaf=5.0)
 
 
 # ============================================================================================
-# SECTION 2 — Métrique : déviance de Poisson
+# SECTION 2 — Métrique
 # ============================================================================================
 def dev_lignes(y, p):
-    """Déviance de Poisson ligne par ligne."""
     y = np.asarray(y, dtype=float)
     p = np.clip(np.asarray(p, dtype=float), 1e-12, None)
     terme = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
@@ -53,13 +61,18 @@ def dev_lignes(y, p):
 
 
 def METRIC(y, p):
-    """Déviance de Poisson totale (plus petit = mieux)."""
     return float(np.sum(dev_lignes(y, p)))
 
 
 def pdev(y, p):
-    """Déviance de Poisson moyenne par ligne."""
     return METRIC(y, p) / max(len(np.asarray(y)), 1)
+
+
+def rep(name, y, p, ref=None):
+    d = METRIC(y, p)
+    gain = f"  gain vs ICA={1 - d / ref:+.2%}" if ref else ""
+    print(f"  {name:<46s} dev_tot={d:>18,.1f}  pred/reel={np.sum(p) / np.sum(y):.4f}{gain}")
+    return d
 
 
 # ============================================================================================
@@ -68,7 +81,7 @@ def pdev(y, p):
 def prep(d):
     d = d.copy()
     d["Year"] = pd.to_numeric(d["Year"]).astype(int)
-    d["YearStart"] = d["Year"] // 100 + 2000            # 910 -> 2009, 2223 -> 2022
+    d["YearStart"] = d["Year"] // 100 + 2000
     d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
     if "AttdAge" not in d.columns:
         d["AttdAge"] = d["IssueAge"] + d["PolYear"] - 1
@@ -129,6 +142,12 @@ def fit(Xtr, ytr, otr, wtr, Xva, yva, ova, wva, seed, max_rounds, params):
                      callbacks=[lgb.early_stopping(100, verbose=False)])
 
 
+def fit_full(X, y, o, w, seed, rounds, params):
+    """Entraînement sur TOUT df avec un nombre d'itérations fixé (trouvé en validation)."""
+    p = dict(params, objective="poisson", seed=seed)
+    return lgb.train(p, lgb.Dataset(X, y, weight=w, init_score=o), rounds)
+
+
 def raw(m, X):
     return m.predict(X, raw_score=True, num_iteration=m.best_iteration)
 
@@ -142,21 +161,35 @@ def amt_targets(d, w0):
     return y, np.log(d["qx_amt"]).values, (d["eff_n"] / w0).values
 
 
-def make_folds(df, mode, n_splits, seed=42):
-    if mode == "interleaved":
+def make_folds(df, validation, n_splits, seed=42):
+    if validation == "interleaved":
         return list(KFold(n_splits, shuffle=True, random_state=seed).split(df))
-    ys = np.sort(df["YearStart"].unique())[-3:]
+    ys = np.sort(df["YearStart"].unique())[-3:]          # 3 dernières années
     yr = df["YearStart"].values
     return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
 
 
-def rep(name, y, p, extra=""):
-    print(f"  {name:<44s} devPoisson_moy={pdev(y, p):>14,.5f}  devPoisson_tot={METRIC(y, p):>18,.2f}"
-          f"  somme_pred/somme_reel={p.sum() / y.sum():.4f} {extra}")
+# ---- Rétrécissement vers l'ICA (filet de sécurité) ----------------------------------------
+def shrink(p, base, alpha):
+    base = np.clip(np.asarray(base, float), 1e-9, None)
+    p = np.clip(np.asarray(p, float), 1e-12, None)
+    return base * (p / base) ** alpha
+
+
+def choisir_alpha(y, p, base, grille=np.linspace(0, 1, 11)):
+    """alpha et facteur f qui minimisent la déviance de  f * ICA * (p/ICA)^alpha."""
+    best = None
+    for a in grille:
+        q = shrink(p, base, a)
+        f = y.sum() / q.sum()
+        d = METRIC(y, f * q)
+        if best is None or d < best[0]:
+            best = (d, float(a), float(f))
+    return best[1], best[2]
 
 
 # ============================================================================================
-# SECTION 6 — Sauvegarde, chargement et prédiction
+# SECTION 6 — Sauvegarde, chargement, prédiction
 # ============================================================================================
 def save_bundle(bundle, path):
     with open(path, "wb") as f:
@@ -173,7 +206,8 @@ def predict(bundle, resultats):
     assert not miss, f"Colonnes manquantes : {miss}"
     res = prep(resultats).reset_index(drop=True)
     if bundle["mode"] == "interleaved":
-        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res, bundle["coh_k"])], axis=1)
+        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res,
+                                                bundle["coh_k"])], axis=1)
     X = res[bundle["feats"]]
     off_c = np.log(res["ExpecCnt"].clip(lower=1e-9)).values
     off_a = np.log(res["qx_amt"]).values
@@ -184,50 +218,39 @@ def predict(bundle, resultats):
     b_te = te_c * np.exp(res["log_avg_size"].values) * \
         pd.Series(bundle["calib_size"]).reindex(res["Size"].values).fillna(1).values
     w = bundle["w_blend"]
+    blend = w * te_a + (1 - w) * b_te
     sub = resultats.copy().reset_index(drop=True)
-    sub["DthCnt"] = np.clip(te_c * bundle["f_c"], 0, None)
-    sub["DthAmt"] = np.clip((w * te_a + (1 - w) * b_te) * bundle["f_a"], 0, None)
+    sub["DthCnt"] = np.clip(shrink(te_c, res["ExpecCnt"].values, bundle["alpha_c"]) * bundle["f_c"], 0, None)
+    sub["DthAmt"] = np.clip(shrink(blend, res["ExpecAmt"].values, bundle["alpha_a"]) * bundle["f_a"], 0, None)
     return sub
 
 
 # ============================================================================================
 # SECTION 7 — Contrôle des données + pipeline d'entraînement
 # ============================================================================================
-CRITIQUES = ["Year", "Size", "IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExpecCnt", "ExpecAmt"]
-
-
 def _lignes_invalides(d, cols):
     x = d[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
     return ~np.isfinite(x).all(axis=1)
 
 
-def verifier_donnees(df, resultats=None, verbose=True):
-    if verbose:
-        rows = []
-        for nom, d, cols in (("df", df, REQUIRED + TARGETS), ("resultats", resultats, REQUIRED)):
-            if d is None:
-                continue
-            for c in cols:
-                x = pd.to_numeric(d[c], errors="coerce")
-                bad = int((~np.isfinite(x.to_numpy(float))).sum())
-                if bad:
-                    rows.append(f"  {nom:<10s} {c:<12s} {bad:>10,} valeurs manquantes/infinies/non numeriques")
-        print("Controle des donnees : " + ("aucun probleme detecte." if not rows else "\n" + "\n".join(rows)))
+def verifier_donnees(df, resultats=None):
     if resultats is not None:
         bad_r = _lignes_invalides(resultats, CRITIQUES)
-        assert not bad_r.any(), (
-            f"{int(bad_r.sum())} lignes de resultats invalides dans {CRITIQUES} "
-            f"(index : {list(resultats.index[bad_r][:5])}).")
+        assert not bad_r.any(), (f"{int(bad_r.sum())} lignes de resultats invalides dans {CRITIQUES} "
+                                 f"(index : {list(resultats.index[bad_r][:5])}).")
     bad = _lignes_invalides(df, CRITIQUES + TARGETS)
     if bad.any():
-        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees de l'entrainement.")
+        print(f"ATTENTION : {int(bad.sum()):,} lignes de df retirees (valeur manquante/infinie).")
         df = df.loc[~bad]
+    else:
+        print("Controle des donnees : aucun probleme detecte.")
     return df
 
 
-def run(df, mode, n_splits=5, seeds=(0, 1, 2), max_rounds=3000, params=None,
-        verbose=True, save_path=None):
+def run(df, mode, validation="temporal", n_splits=5, seeds=(0, 1, 2), max_rounds=3000,
+        params=None, verbose=True, save_path=None):
     params = dict(PARAMS, **(params or {}))
+    p_cnt = dict(params, **EXTRA_CNT)
     miss = [c for c in REQUIRED + TARGETS if c not in df.columns]
     assert not miss, f"Colonnes manquantes : {miss}"
 
@@ -238,13 +261,13 @@ def run(df, mode, n_splits=5, seeds=(0, 1, 2), max_rounds=3000, params=None,
         feats = [f for f in feats if f not in ("YearStart", "IssueYear")]
     w0 = df["eff_n"].mean()
     if verbose:
-        print(f"Mode : {mode} | lignes df={len(df):,} | {len(feats)} features")
+        print(f"Mode prediction : {mode} | validation : {validation} | lignes df={len(df):,} | {len(feats)} features")
 
+    # ---------- 1) Validation : prédictions hors-pli + nombre d'itérations ----------
     n = len(df)
     oof_c, oof_a = np.full(n, np.nan), np.full(n, np.nan)
-    models_c, models_a = [], []
-
-    for k, (tr, va) in enumerate(make_folds(df, mode, n_splits)):
+    it_c, it_a = [], []
+    for k, (tr, va) in enumerate(make_folds(df, validation, n_splits)):
         d_tr0, d_va0 = df.iloc[tr], df.iloc[va]
         if use_coh:
             d_tr = pd.concat([d_tr0, cohort_oof(d_tr0, seed=k)], axis=1)
@@ -255,23 +278,20 @@ def run(df, mode, n_splits=5, seeds=(0, 1, 2), max_rounds=3000, params=None,
         ya_tr, oa_tr, wa_tr = amt_targets(d_tr, w0); ya_va, oa_va, wa_va = amt_targets(d_va, w0)
         pc_va, pa_va = np.zeros(len(va)), np.zeros(len(va))
         for s in seeds:
-            mc = fit(d_tr[feats], yc_tr, oc_tr, None, d_va[feats], yc_va, oc_va, None, s, max_rounds, params)
+            mc = fit(d_tr[feats], yc_tr, oc_tr, None, d_va[feats], yc_va, oc_va, None, s, max_rounds, p_cnt)
             ma = fit(d_tr[feats], ya_tr, oa_tr, wa_tr, d_va[feats], ya_va, oa_va, wa_va, s, max_rounds, params)
             pc_va += np.exp(raw(mc, d_va[feats]) + oc_va) / len(seeds)
             pa_va += d_va["ExposAmt"].values * np.exp(raw(ma, d_va[feats]) + oa_va) / len(seeds)
-            models_c.append(mc.model_to_string(num_iteration=mc.best_iteration))
-            models_a.append(ma.model_to_string(num_iteration=ma.best_iteration))
+            it_c.append(max(mc.best_iteration, 1)); it_a.append(max(ma.best_iteration, 1))
         oof_c[va], oof_a[va] = pc_va, pa_va
         if verbose:
             print(f"  pli {k + 1}: iter cnt={mc.best_iteration}, iter amt={ma.best_iteration}")
 
     cov = ~np.isnan(oof_c)
     yc, ya = df["DthCnt"].values[cov], df["DthAmt"].values[cov]
-    if verbose:
-        print("\n== DthCnt - validation hors-pli (sur df) ==")
-        rep("Baseline ICA (ExpecCnt)", yc, df["ExpecCnt"].values[cov])
-        rep("Modele GBM Poisson + offset", yc, oof_c[cov])
+    bc, ba = df["ExpecCnt"].values[cov], df["ExpecAmt"].values[cov]
 
+    # ---------- 2) Blend du montant ----------
     avg_size = np.exp(df["log_avg_size"].values)
     calib = (pd.Series(ya).groupby(df["Size"].values[cov]).sum() /
              pd.Series(oof_c[cov] * avg_size[cov]).groupby(df["Size"].values[cov]).sum()
@@ -279,21 +299,38 @@ def run(df, mode, n_splits=5, seeds=(0, 1, 2), max_rounds=3000, params=None,
     b_oof = oof_c[cov] * avg_size[cov] * calib.reindex(df["Size"].values[cov]).fillna(1).values
     a_oof = oof_a[cov]
     ws = np.linspace(0, 1, 11)
-    w_best = ws[int(np.argmin([METRIC(ya, w * a_oof + (1 - w) * b_oof) for w in ws]))]
+    w_best = float(ws[int(np.argmin([METRIC(ya, w * a_oof + (1 - w) * b_oof) for w in ws]))])
     blend_oof = w_best * a_oof + (1 - w_best) * b_oof
-    if verbose:
-        print("\n== DthAmt - validation hors-pli (sur df) ==")
-        rep("Baseline ICA (ExpecAmt)", ya, df["ExpecAmt"].values[cov])
-        rep("A. GBM montant direct", ya, a_oof)
-        rep("B. deces predits x montant moyen", ya, b_oof)
-        rep(f"Blend (poids A={w_best:.1f})", ya, blend_oof)
 
-    f_c, f_a = yc.sum() / oof_c[cov].sum(), ya.sum() / blend_oof.sum()
+    # ---------- 3) Rétrécissement vers l'ICA + calibration ----------
+    alpha_c, f_c = choisir_alpha(yc, oof_c[cov], bc)
+    alpha_a, f_a = choisir_alpha(ya, blend_oof, ba)
+
     if verbose:
-        print(f"\nCalibration : DthCnt x{f_c:.4f} | DthAmt x{f_a:.4f}")
+        for nom, y, b, brut, al, f in (("DthCnt", yc, bc, oof_c[cov], alpha_c, f_c),
+                                        ("DthAmt", ya, ba, blend_oof, alpha_a, f_a)):
+            print(f"\n== {nom} - validation ({validation}) ==")
+            ref = rep("ICA brute", y, b)
+            rep("ICA recalibree (niveau corrige)", y, b * y.sum() / b.sum(), ref)
+            rep("Modele brut", y, brut, ref)
+            rep(f"Modele final (alpha={al:.1f}, f={f:.4f})", y, f * shrink(brut, b, al), ref)
+            if al == 0:
+                print("  -> alpha=0 : le modele n'apporte rien sur les annees recentes ; "
+                      "la prediction = ICA recalibree.")
+
+    # ---------- 4) Réentraînement sur TOUT df ----------
+    n_c = max(50, int(np.mean(it_c) * 1.1))
+    n_a = max(50, int(np.mean(it_a) * 1.1))
+    d_full = pd.concat([df, cohort_oof(df, seed=123)], axis=1) if use_coh else df
+    yc_f, oc_f = cnt_targets(d_full)
+    ya_f, oa_f, wa_f = amt_targets(d_full, w0)
+    if verbose:
+        print(f"\nReentrainement sur tout df : {n_c} iter (nombre), {n_a} iter (montant), {len(seeds)} graine(s)")
+    models_c = [fit_full(d_full[feats], yc_f, oc_f, None, s, n_c, p_cnt).model_to_string() for s in seeds]
+    models_a = [fit_full(d_full[feats], ya_f, oa_f, wa_f, s, n_a, params).model_to_string() for s in seeds]
 
     bundle = dict(mode=mode, feats=feats, models_c=models_c, models_a=models_a,
-                  w_blend=float(w_best), f_c=float(f_c), f_a=float(f_a),
+                  w_blend=w_best, alpha_c=alpha_c, alpha_a=alpha_a, f_c=f_c, f_a=f_a,
                   calib_size={int(k): float(v) for k, v in calib.items()}, coh_k=1.0)
     if use_coh:
         bundle["coh_g"], bundle["coh_k_amt"] = cohort_table(df, bundle["coh_k"])
@@ -305,16 +342,17 @@ def run(df, mode, n_splits=5, seeds=(0, 1, 2), max_rounds=3000, params=None,
 
 
 # ============================================================================================
-# SECTION 8 — EXÉCUTION (entraînement sur df, prédiction sur resultats)
+# SECTION 8 — EXÉCUTION
 # ============================================================================================
-def executer(df, resultats, save_path="modele_mortalite.pkl", out_csv="soumission.csv", rapide=False):
+def executer(df, resultats, validation="temporal", save_path="modele_mortalite_v2.pkl",
+             out_csv="soumission.csv", rapide=False):
     df = verifier_donnees(df, resultats)
     part = pd.to_numeric(resultats["Year"]).isin(pd.to_numeric(df["Year"])).mean()
     mode = "interleaved" if part > 0.9 else "temporal"
     print(f"Part des lignes de resultats dont l'annee existe dans df : {part:.1%} -> mode = {mode}\n")
 
     kw = dict(params=dict(learning_rate=0.1), seeds=(0,), n_splits=3, max_rounds=500) if rapide else {}
-    bundle = run(df, mode=mode, save_path=save_path, **kw)
+    bundle = run(df, mode=mode, validation=validation, save_path=save_path, **kw)
 
     sub = predict(bundle, resultats)
     assert len(sub) == len(resultats), "le nombre de lignes a change"
@@ -328,66 +366,54 @@ def executer(df, resultats, save_path="modele_mortalite.pkl", out_csv="soumissio
 # SECTION 9 — DIAGNOSTIC sur les vraies valeurs
 # ============================================================================================
 def diagnostic(sub, verite):
-    """sub = prédictions, verite = mêmes lignes avec les vraies DthCnt / DthAmt (même ordre)."""
     sub, verite = sub.reset_index(drop=True), verite.reset_index(drop=True)
     assert len(sub) == len(verite), "sub et verite n'ont pas le meme nombre de lignes"
 
     for cible, base in (("DthCnt", "ExpecCnt"), ("DthAmt", "ExpecAmt")):
         y_all = pd.to_numeric(verite[cible], errors="coerce").to_numpy(float)
         ok = np.isfinite(y_all)
-        y = y_all[ok]
-        p = sub[cible].to_numpy(float)[ok]
-        b = verite[base].to_numpy(float)[ok]
+        y, p, b = y_all[ok], sub[cible].to_numpy(float)[ok], verite[base].to_numpy(float)[ok]
         d_mod, d_ica = dev_lignes(y, p), dev_lignes(y, b)
-        z = y == 0
 
         print(f"\n{'=' * 25} {cible} {'=' * 25}")
-        if (~ok).any():
-            print(f"({int((~ok).sum()):,} lignes sans vraie valeur ignorees)")
-        print(f"Lignes avec {cible}=0 (reel)           : {z.mean():.1%}")
-        print(f"Predictions exactement 0             : {(p == 0).sum():,} "
-              f"(dont {int(((p == 0) & (b == 0)).sum()):,} avec {base}=0)")
-        print(f"Deviance totale  MODELE = {d_mod.sum():,.0f}")
-        print(f"Deviance totale  ICA    = {d_ica.sum():,.0f}")
-        print(f"Gain vs ICA (D2)        = {1 - d_mod.sum() / d_ica.sum():+.2%}   (positif = modele meilleur)")
-        print(f"Part de la deviance venant des lignes y=0 : modele {d_mod[z].sum() / d_mod.sum():.1%}"
-              f" | ICA {d_ica[z].sum() / d_ica.sum():.1%}")
+        print(f"Deviance MODELE = {d_mod.sum():,.0f} | ICA = {d_ica.sum():,.0f} | "
+              f"gain vs ICA = {1 - d_mod.sum() / d_ica.sum():+.2%}")
         print(f"Somme pred / somme reel : modele {p.sum() / y.sum():.4f} | ICA {b.sum() / y.sum():.4f}")
-        if cible == "DthCnt":
-            print("Predictions quasi nulles : " +
-                  " | ".join(f"< {s}: {(p < s).mean():.1%}" for s in (1e-3, 1e-2, 0.05, 0.1)))
 
-        print("Test 'forcer a 0 les petites predictions' :")
-        for q in (0.5, 0.8, 0.9, 0.97):
-            s = np.quantile(p, q)
-            p0 = np.where(p < s, 0.0, p)
-            print(f"  pred < {s:.4g} (quantile {q:.0%}) -> 0  =>  deviance {dev_lignes(y, p0).sum():,.0f}")
+        # Niveau vs forme : on corrige le niveau des deux (avec la vérité, POUR DIAGNOSTIC SEULEMENT)
+        d_mod_n = METRIC(y, p * y.sum() / p.sum())
+        d_ica_n = METRIC(y, b * y.sum() / b.sum())
+        print(f"Niveau corrige (diagnostic) : modele {d_mod_n:,.0f} | ICA {d_ica_n:,.0f} | "
+              f"gain {1 - d_mod_n / d_ica_n:+.2%}")
+        if d_mod.sum() > d_ica.sum() and d_mod_n < d_ica_n:
+            print("  -> Probleme de NIVEAU (tendance / calibration), la forme du modele est bonne.")
+        elif d_mod_n >= d_ica_n:
+            print("  -> Probleme de FORME (sur-apprentissage ou variables qui ne se transposent pas).")
 
         t = pd.DataFrame({"y": y, "pred": p, "ica": b, "dev_mod": d_mod, "dev_ica": d_ica,
                           "Size": verite["Size"].values[ok], "Year": verite["Year"].values[ok]})
-        print("\nTop 10 lignes les plus couteuses (modele) :")
-        print(t.nlargest(10, "dev_mod").round(3).to_string())
-        print("\nDeviance par Size (modele vs ICA) :")
-        print(t.groupby("Size")[["dev_mod", "dev_ica"]].sum().round(0).to_string())
-        print("\nDeviance par Year (modele vs ICA) :")
-        print(t.groupby("Year")[["dev_mod", "dev_ica"]].sum().round(0).to_string())
+        print("\nPar Year :")
+        g = t.groupby("Year")[["y", "pred", "ica", "dev_mod", "dev_ica"]].sum()
+        g["gain"] = 1 - g["dev_mod"] / g["dev_ica"]
+        print(g.round(3).to_string())
+        print("\nPar Size :")
+        g = t.groupby("Size")[["y", "pred", "ica", "dev_mod", "dev_ica"]].sum()
+        g["gain"] = 1 - g["dev_mod"] / g["dev_ica"]
+        print(g.round(3).to_string())
 
 
 # ============================================================================================
 # SECTION 10 — TEST DE BOUT EN BOUT
 # ============================================================================================
-def tester(df, resultats_vrais, rapide=False, save_path="modele_mortalite.pkl", out_csv="soumission.csv"):
-    """
-    resultats_vrais = resultats AVEC les vraies DthCnt / DthAmt.
-    Les cibles sont retirées avant la prédiction (aucune fuite), puis comparées aux prédictions.
-    """
+def tester(df, resultats_vrais, rapide=False, validation="temporal",
+           save_path="modele_mortalite_v2.pkl", out_csv="soumission.csv"):
     verite = resultats_vrais.reset_index(drop=True)
     a_predire = verite.drop(columns=TARGETS, errors="ignore")
-    sub = executer(df, a_predire, save_path=save_path, out_csv=out_csv, rapide=rapide)
+    sub = executer(df, a_predire, validation=validation, save_path=save_path,
+                   out_csv=out_csv, rapide=rapide)
     diagnostic(sub, verite)
     return sub
 
 
-# Exemple (décommente la ligne voulue) :
 # sub = tester(df, resultats, rapide=True)   # test rapide
 # sub = tester(df, resultats)                # complet
